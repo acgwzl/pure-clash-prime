@@ -219,6 +219,8 @@ pub(super) struct TrayTexts {
 const CONNECTIONS_RENDER_LIMIT: usize = 200;
 /// 实时连接与流量的轮询间隔；与内核 dashboard 的默认推送节奏一致。
 const CONNECTIONS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Provider 可在 controller 就绪后才完成加载，也可独立于客户端订阅更新。
+const PROXIES_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 订阅自动更新调度器的检查间隔；到期判断是墙钟比较，跳频只影响响应速度。
 const PROFILE_UPDATE_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -244,6 +246,8 @@ pub(crate) struct PureClash {
     tun_configured: bool,
     /// TUN 授权与初始化全过程的状态；只有 controller 确认后才进入 On。
     tun_state: SwitchState,
+    /// 专用 DIRECT 入口通过本机转发检查后，才允许订阅使用它重试。
+    subscription_direct_ready: bool,
     /// 登录自启状态始终来自平台配置，不复制到 `app.json`，避免与系统启动管理器分叉。
     autostart_enabled: bool,
     /// macOS 等尚未实现平台注册的平台显示禁用态，不能响应开关操作。
@@ -261,6 +265,8 @@ pub(crate) struct PureClash {
     proxy_error: Option<String>,
     /// controller 返回的真实策略组快照；内核未运行时为空。
     groups: Vec<GroupSnapshot>,
+    /// 缓存配置中的分组顺序；后台同步只读 controller，不重复解析整份 YAML。
+    proxy_group_order: Option<Vec<String>>,
     /// 运行配置请求失败边沿标记；与连接轮询独立，避免一条请求吞掉另一条日志。
     runtime_state_failing: bool,
     /// 连接轮询失败边沿标记：只在失败开始与恢复时各记一条日志。
@@ -320,11 +326,15 @@ pub(crate) struct PureClash {
     node_endpoints: std::collections::HashMap<String, NodeEndpoint>,
     /// 概览页服务器地址是否明文展示；默认打码，眼睛图标切换。
     server_visible: bool,
+    /// 每次启动仅在首次打开主窗口时自动检查，关闭再打开不重复请求。
+    startup_update_checked: bool,
     /// 关于页检查更新是否进行中。
     update_checking: bool,
     /// 检查发现新版本时置位；界面用它强调更新提示。
     update_available: bool,
-    /// 关于页检查更新的结果文案；None 表示尚未检查。
+    /// 当前提示是否为下载链接；手动重查失败时保留 new 标志，但错误文字不可点击。
+    update_status_is_release: bool,
+    /// 关于页检查更新的结果文案；静默检查失败时也保持 None。
     update_status: Option<SharedString>,
     /// 自定义监听添加表单的输入状态。
     listener_form_name: Entity<TextInput>,
@@ -456,6 +466,7 @@ impl PureClash {
             // 配置期望与真实运行状态分离；只有 controller 确认后才显示 TUN 开启。
             tun_configured,
             tun_state: SwitchState::Off,
+            subscription_direct_ready: false,
             autostart_enabled,
             autostart_available,
             // Windows 登录恢复 TUN 必须允许 UAC；Linux 已安装服务可在 false 时静默
@@ -467,6 +478,7 @@ impl PureClash {
             node_switching: false,
             proxy_error: None,
             groups: Vec::new(),
+            proxy_group_order: None,
             runtime_state_failing: false,
             connections_failing: false,
             connections: Vec::new(),
@@ -499,8 +511,10 @@ impl PureClash {
             group_page: std::collections::HashMap::new(),
             node_endpoints: std::collections::HashMap::new(),
             server_visible: false,
+            startup_update_checked: false,
             update_checking: false,
             update_available: false,
+            update_status_is_release: false,
             update_status: None,
             listener_form_name,
             listener_form_port,
@@ -513,6 +527,7 @@ impl PureClash {
             app.start_core(cx);
         }
         app.spawn_connection_poll(cx);
+        app.spawn_proxy_poll(cx);
         app.spawn_profile_update_scheduler(cx);
         app
     }
@@ -586,25 +601,28 @@ impl PureClash {
             self.refresh_autostart_status();
         }
         self.page = page;
-        // 进入关于页时自动检查一次更新；本会话已有结果或正在检查则跳过，
-        // 手动按钮随时可以重新检查。
-        if page == Page::About && self.update_status.is_none() && !self.update_checking {
-            self.check_for_updates(cx);
-        }
         cx.notify();
+    }
+
+    /// 后台自启等用户打开窗口后再检查；失败也算已尝试，避免反复请求。
+    fn check_startup_updates(&mut self, cx: &mut Context<Self>) {
+        if self.startup_update_checked {
+            return;
+        }
+        self.startup_update_checked = true;
+        self.check_for_updates(true, cx);
     }
 
     /// 关于页检查更新：查询仓库最新发布版本并与当前版本比较。
     ///
-    /// 进入关于页自动触发一次，也可通过按钮手动重查；不做自动安装，
-    /// 发现新版本时仅在关于页提示并引导用户前往仓库。
-    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+    /// 首次打开窗口静默检查，也可通过按钮手动重查；不做自动安装，
+    /// 发现新版本时在侧栏和关于页提示，并引导用户前往仓库。
+    fn check_for_updates(&mut self, silent: bool, cx: &mut Context<Self>) {
         if self.update_checking {
             return;
         }
         self.update_checking = true;
-        self.update_available = false;
-        self.update_status = None;
+        // 重查期间保留已知更新，网络失败不能让侧栏标志消失。
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -613,10 +631,17 @@ impl PureClash {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.update_checking = false;
+                if let Ok(latest) = &result {
+                    this.update_available = latest.as_ref().is_some_and(|latest| {
+                        crate::app::about::is_newer_version(latest, Self::CURRENT_VERSION)
+                    });
+                }
+                if !(silent && result.is_err()) {
+                    this.update_status_is_release = result.is_ok() && this.update_available;
+                }
                 this.update_status = Some(match result {
                     Ok(Some(latest)) => {
-                        if crate::app::about::is_newer_version(&latest, Self::CURRENT_VERSION) {
-                            this.update_available = true;
+                        if this.update_available {
                             log_info!(
                                 "update",
                                 "发现新版本 {latest}（当前 v{}）",
@@ -630,6 +655,10 @@ impl PureClash {
                         }
                     }
                     Ok(None) => tr("about.no_release"),
+                    Err(_) if silent => {
+                        cx.notify();
+                        return;
+                    }
                     Err(error) => {
                         log_warn!("update", "检查应用更新失败：{error:#}");
                         SharedString::from(
@@ -841,6 +870,31 @@ impl PureClash {
         if !self.core_operable() || self.mihomo_process.is_some() {
             return;
         }
+        let reservation = if let Some(baseline) = self.baseline.as_mut() {
+            match profile::prepare_subscription_direct_startup(
+                &self.paths,
+                baseline,
+                &self.config.mihomo_version,
+                self.active_profile.as_deref(),
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    log_error!("core", "准备订阅直连入口失败：{error:#}");
+                    self.mihomo_error = Some(
+                        t!(
+                            "app.core_start_failed",
+                            error = concise_error(&format!("{error:#}"), 180)
+                        )
+                        .into_owned(),
+                    );
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.subscription_direct_ready = false;
         self.core_start_generation = self.core_start_generation.wrapping_add(1);
         let generation = self.core_start_generation;
         self.core_state = CoreState::Starting;
@@ -865,6 +919,8 @@ impl PureClash {
             if elevated { "，提权/TUN" } else { "" },
             config_file.display()
         );
+        // Mihomo 需要自行绑定端口；释放到绑定之间仍可能被抢占，启动后还要检查实际转发。
+        drop(reservation);
 
         #[cfg(target_os = "windows")]
         {
@@ -1063,6 +1119,7 @@ impl PureClash {
                     // 只有 controller 明确返回开启，界面和托盘才显示 TUN 已生效。
                     log_info!("tun", "controller 确认 TUN 已生效");
                     this.tun_state = SwitchState::On;
+                    this.verify_subscription_direct(generation, cx);
                     cx.notify();
                     return;
                 };
@@ -1084,6 +1141,53 @@ impl PureClash {
                 });
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    fn verify_subscription_direct(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let Some(baseline) = self.baseline.as_ref() else {
+            return;
+        };
+        let controller = Controller::new(baseline);
+        let proxy = baseline.subscription_direct_proxy_url();
+        cx.spawn(async move |this, cx| {
+            let background = cx.background_executor().clone();
+            let started = std::time::Instant::now();
+            loop {
+                let active = this
+                    .update(cx, |this, _| {
+                        generation == this.core_start_generation && this.tun_running()
+                    })
+                    .unwrap_or(false);
+                if !active {
+                    return;
+                }
+                let controller = controller.clone();
+                let proxy = proxy.clone();
+                let result = background
+                    .spawn(async move { controller.check_subscription_direct(&proxy) })
+                    .await;
+                if result.is_ok() || started.elapsed() >= std::time::Duration::from_secs(3) {
+                    let _ = this.update(cx, |this, cx| {
+                        if generation != this.core_start_generation || !this.tun_running() {
+                            return;
+                        }
+                        this.subscription_direct_ready = result.is_ok();
+                        if let Err(error) = result {
+                            // 专用入口失败不关闭已工作的 TUN，但禁止把普通系统请求当成直连重试。
+                            log_warn!("profile", "订阅直连入口检查失败：{error:#}");
+                            this.integration_error =
+                                Some(t!("profiles.direct_unavailable").into_owned());
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+                background
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+            }
         })
         .detach();
     }
@@ -1170,6 +1274,11 @@ impl PureClash {
 
     /// 后台拉取运行模式与代理组；内核未运行时忽略。
     fn fetch_runtime_state(&mut self, cx: &mut Context<Self>) {
+        self.sync_runtime_state(true, cx);
+    }
+
+    /// 首次加载、手动刷新及配置切换重读文件；后台轮询沿用配置元数据。
+    fn sync_runtime_state(&mut self, refresh_metadata: bool, cx: &mut Context<Self>) {
         if !self.mihomo_running() || self.proxies_loading || self.node_switching {
             return;
         }
@@ -1177,6 +1286,7 @@ impl PureClash {
             return;
         };
         let runtime_config = self.paths.runtime_mihomo_config_file.clone();
+        let refresh_metadata = refresh_metadata || self.proxy_group_order.is_none();
         let selections = self.config.selected_nodes.clone();
         let generation = self.core_start_generation;
         self.proxies_loading = true;
@@ -1186,15 +1296,15 @@ impl PureClash {
                 // 客户端持久化不依赖内核 cache.db，普通内核和 Linux TUN 服务均适用。
                 controller.restore_proxy_selections(&selections)?;
                 let config = controller.configs()?;
-                let mut proxies = controller.proxies(config.mode)?;
-                // controller 返回无序映射，分组按订阅定义顺序展示。
-                order_groups(
-                    &mut proxies.groups,
-                    &read_proxy_group_order(&runtime_config),
-                );
-                // 节点接入信息（协议/服务器/端口）来自 runtime.yaml，供概览页展示。
-                let endpoints = read_node_endpoints(&runtime_config);
-                Ok::<_, anyhow::Error>((config, proxies, endpoints))
+                let proxies = controller.proxies(config.mode)?;
+                let metadata = refresh_metadata.then(|| {
+                    (
+                        read_proxy_group_order(&runtime_config),
+                        // 节点接入信息（协议/服务器/端口）来自 runtime.yaml，供概览页展示。
+                        read_node_endpoints(&runtime_config),
+                    )
+                });
+                Ok::<_, anyhow::Error>((config, proxies, metadata))
             });
             let result = snapshot.await;
             let _ = this.update(cx, |this, cx| {
@@ -1203,18 +1313,32 @@ impl PureClash {
                 }
                 this.proxies_loading = false;
                 match result {
-                    Ok((config, proxies, endpoints)) => {
+                    Ok((config, mut proxies, metadata)) => {
+                        if let Some((order, endpoints)) = metadata {
+                            this.proxy_group_order = Some(order);
+                            this.node_endpoints = endpoints;
+                        }
+                        // controller 返回无序映射，分组仍按订阅定义顺序展示。
+                        order_groups(
+                            &mut proxies.groups,
+                            this.proxy_group_order.as_deref().unwrap_or_default(),
+                        );
                         this.mode = ProxyMode::from_controller(config.mode);
                         this.groups = proxies.groups;
-                        this.node_endpoints = endpoints;
                         if this.runtime_state_failing {
                             this.runtime_state_failing = false;
+                            // 只清理由本次同步恢复的错误，不覆盖用户其他操作的提示。
+                            if this.proxy_error.as_deref()
+                                == Some(t!("proxy.nodes_restore_failed").as_ref())
+                            {
+                                this.proxy_error = None;
+                            }
                             log_info!("controller", "controller 运行配置请求恢复正常");
                         }
                     }
                     Err(error) => {
                         this.proxy_error = Some(t!("proxy.nodes_restore_failed").into_owned());
-                        // 每秒轮询失败只做边沿记录：从成功转入失败记一条 warn，
+                        // 轮询失败只做边沿记录：从成功转入失败记一条 warn，
                         // 恢复时记一条 info，避免刷屏。
                         if !this.runtime_state_failing {
                             this.runtime_state_failing = true;
@@ -1224,6 +1348,27 @@ impl PureClash {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// 持续同步分组成员和已选节点，避免界面停留在 provider 加载前的 COMPATIBLE 快照。
+    fn spawn_proxy_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PROXIES_POLL_INTERVAL).await;
+                if this
+                    .update(cx, |this, cx| {
+                        // 复用代理加载互斥与启动代次校验；恢复记忆节点不能与用户操作竞态。
+                        if this.mihomo_running() && !this.profile_actions_locked() {
+                            this.sync_runtime_state(false, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -1531,6 +1676,7 @@ impl PureClash {
 
         self.core_state = CoreState::Stopped;
         self.tun_state = SwitchState::Off;
+        self.subscription_direct_ready = false;
         if let Some(Err(error)) = stop_result {
             let detail = concise_error(&format!("{error:#}"), 240);
             log_error!("core", "停止 Mihomo 失败：{error:#}");
@@ -1543,6 +1689,7 @@ impl PureClash {
         // 内核停止后在线数据不再有效；TUN 的回退由真实停机路径（toggle_core/
         // 启动失败回退）显式调用 revert_tun，配置切换重启不在此处处理。
         self.groups.clear();
+        self.proxy_group_order = None;
         self.proxies_loading = false;
         self.connections.clear();
         self.traffic_down_speed = 0;
@@ -1600,6 +1747,25 @@ impl PureClash {
                 self.integration_error = Some(system_proxy_error(&error));
             }
         }
+    }
+
+    /// 在主线程捕获出口状态，后台下载期间不切换模式或关闭 TUN。
+    fn subscription_proxy(&self) -> Option<profile::SubscriptionProxy> {
+        if !self.mihomo_running() || !(self.system_proxy || self.tun_state == SwitchState::On) {
+            return None;
+        }
+        let baseline = self.baseline.as_ref()?;
+        let (http_addr, _) = self.current_proxy_endpoints();
+        Some(profile::SubscriptionProxy {
+            preferred: format!("http://{http_addr}"),
+            direct: if self.tun_state != SwitchState::On {
+                profile::SubscriptionDirect::System
+            } else if self.subscription_direct_ready {
+                profile::SubscriptionDirect::Proxy(baseline.subscription_direct_proxy_url())
+            } else {
+                profile::SubscriptionDirect::Unavailable
+            },
+        })
     }
 
     /// 启用系统代理并保存托管前的系统设置快照。
@@ -2264,7 +2430,9 @@ impl PureClash {
     /// 配置页动作互斥锁：模式/节点切换与恢复、手动忙态、行内编辑或自动更新进行中时，
     /// 暂停其他会修改配置列表 / profile 文件的操作，避免并发写与下标漂移。
     fn profile_actions_locked(&self) -> bool {
-        self.mode_switching
+        self.core_state == CoreState::Starting
+            || self.tun_state == SwitchState::Starting
+            || self.mode_switching
             || self.node_switching
             || self.proxies_loading
             || self.profile_busy.is_some()
@@ -2324,6 +2492,7 @@ impl PureClash {
         let version = self.config.mihomo_version.clone();
         let paths = self.paths.clone();
         self.profile_busy = Some(t!("profiles.busy_downloading").into_owned());
+        let download_proxy = self.subscription_proxy();
         self.profile_error = None;
         cx.notify();
 
@@ -2333,7 +2502,8 @@ impl PureClash {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let content = profile::download_subscription(&url_inner)?;
+                    let content =
+                        profile::download_subscription(&url_inner, download_proxy.as_ref())?;
                     let id = profile::new_profile_id();
                     let runtime = profile::validate_and_store(&paths, &version, &id, &content)?;
                     Ok::<_, anyhow::Error>((id, runtime))
@@ -2499,6 +2669,7 @@ impl PureClash {
         let paths = self.paths.clone();
         let id = meta.id.clone();
         self.profile_busy = Some(t!("profiles.busy_updating").into_owned());
+        let download_proxy = self.subscription_proxy();
         self.profile_error = None;
         cx.notify();
 
@@ -2508,7 +2679,7 @@ impl PureClash {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let content = profile::download_subscription(&url)?;
+                    let content = profile::download_subscription(&url, download_proxy.as_ref())?;
                     let runtime =
                         profile::validate_and_store(&paths, &version, &id_inner, &content)?;
                     Ok::<_, anyhow::Error>(runtime)
@@ -2617,6 +2788,7 @@ impl PureClash {
         let host = host_of_url(&url).to_owned();
         let name = meta.name.clone();
         log_info!("profile", "订阅到期，自动更新开始（{name}，{host}）");
+        let download_proxy = self.subscription_proxy();
 
         cx.spawn(async move |this, cx| {
             let id_inner = id.clone();
@@ -2625,7 +2797,7 @@ impl PureClash {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let content = profile::download_subscription(&url)?;
+                    let content = profile::download_subscription(&url, download_proxy.as_ref())?;
                     let profile_path = profile::profile_yaml_path(&paths, &id_inner);
                     // 与磁盘上的现有内容直接比对（本地比较，语义等同哈希且
                     // 无碰撞）：一致则磁盘内容已通过校验，跳过落盘与 -t 终审。

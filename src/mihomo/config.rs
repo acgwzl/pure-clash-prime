@@ -14,6 +14,8 @@ use super::controller::Mode;
 use crate::config::CustomListener;
 use crate::platform::AppPaths;
 
+pub(crate) const SUBSCRIPTION_DIRECT_LISTENER: &str = "pure-clash-subscription-direct";
+
 /// 客户端本地基线；保存端口、controller 地址与随机 secret 等本机字段。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalBaseline {
@@ -22,6 +24,8 @@ pub(crate) struct LocalBaseline {
     pub(crate) mode: Mode,
     /// 本地代理混合监听端口。
     pub(crate) mixed_port: u16,
+    /// TUN 下订阅重试使用的回环直连入口，不显示在用户监听列表中。
+    pub(crate) subscription_direct_port: u16,
     /// external controller 监听地址（仅回环）。
     pub(crate) controller_addr: String,
     /// controller 访问凭据；每安装随机生成，只存在于 local.yaml 与内存。
@@ -41,13 +45,22 @@ pub(crate) fn ensure_baseline(paths: &AppPaths) -> Result<LocalBaseline> {
     if file.is_file() {
         let content = fs::read_to_string(file)
             .with_context(|| format!("无法读取本地基线配置：{}", file.display()))?;
-        return parse_baseline(&content)
-            .with_context(|| format!("本地基线配置无效：{}", file.display()));
+        let baseline = parse_baseline(&content)
+            .with_context(|| format!("本地基线配置无效：{}", file.display()))?;
+        // 旧配置只分配一次端口；运行中保持不变，启动时再检查是否被其他程序占用。
+        if serde_yaml::from_str::<Value>(&content)?
+            .get("subscription-direct-port")
+            .is_none()
+        {
+            save_baseline(paths, &baseline)?;
+        }
+        return Ok(baseline);
     }
 
     let baseline = LocalBaseline {
         mode: Mode::Rule,
         mixed_port: 7890,
+        subscription_direct_port: unused_local_port()?,
         controller_addr: "127.0.0.1:9097".to_owned(),
         secret: Uuid::new_v4().to_string(),
         tun_enable: false,
@@ -67,6 +80,51 @@ pub(crate) fn save_baseline(paths: &AppPaths, baseline: &LocalBaseline) -> Resul
 }
 
 impl LocalBaseline {
+    /// 仅在旧内核停止后调用；保留可用端口，发生冲突时换用系统分配的空闲端口。
+    /// 持有返回的 socket 直到配置写完，缩短端口被其他程序抢占的窗口。
+    pub(crate) fn reserve_subscription_direct_port(
+        &mut self,
+    ) -> Result<Option<std::net::TcpListener>> {
+        if !self.tun_enable {
+            return Ok(None);
+        }
+        let is_configured_port = |port| {
+            port == self.mixed_port
+                || self
+                    .controller_addr
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    == Some(port)
+                || self.listeners.iter().any(|listener| listener.port == port)
+        };
+        if !is_configured_port(self.subscription_direct_port)
+            && let Ok(listener) =
+                std::net::TcpListener::bind(("127.0.0.1", self.subscription_direct_port))
+        {
+            return Ok(Some(listener));
+        }
+        // 尚未启动的用户监听也要避开；暂时保留这些 socket，避免系统反复返回同一端口。
+        let mut excluded = Vec::new();
+        loop {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").context("无法为订阅直连分配本机端口")?;
+            let port = listener.local_addr()?.port();
+            if !is_configured_port(port) {
+                self.subscription_direct_port = port;
+                return Ok(Some(listener));
+            }
+            excluded.push(listener);
+        }
+    }
+
+    pub(crate) fn subscription_direct_proxy_url(&self) -> String {
+        format!(
+            "socks5://pure-clash:{}@127.0.0.1:{}",
+            self.secret, self.subscription_direct_port
+        )
+    }
+
     /// 序列化为 YAML 文本；secret 随文件落盘，调用方不得写日志。
     fn to_yaml(&self) -> String {
         let mut mapping = Mapping::new();
@@ -81,6 +139,10 @@ impl LocalBaseline {
         };
         // 本地监听字段：订阅不得打开额外端口或允许局域网访问。
         set("mixed-port", Value::from(self.mixed_port));
+        set(
+            "subscription-direct-port",
+            Value::from(self.subscription_direct_port),
+        );
         set("port", Value::from(0));
         set("socks-port", Value::from(0));
         set("redir-port", Value::from(0));
@@ -189,6 +251,15 @@ impl LocalBaseline {
                     Value::from("https://8.8.8.8/dns-query"),
                 ]),
             );
+            // DIRECT 重试的域名解析也必须独立于故障节点；仅 DIRECT 出站使用。
+            dns.insert(
+                Value::from("direct-nameserver"),
+                Value::Sequence(vec![Value::from("https://223.5.5.5/dns-query#DIRECT")]),
+            );
+            dns.insert(
+                Value::from("direct-nameserver-follow-policy"),
+                Value::from(false),
+            );
             set("dns", Value::Mapping(dns));
         }
         // external controller 只监听回环，secret 随机生成。
@@ -224,7 +295,35 @@ impl LocalBaseline {
         } else {
             mapping.remove(Value::from("listeners"));
         }
+        if self.tun_enable {
+            // 单独指定 DIRECT 优先于全局模式和普通规则，不需要关闭 TUN 或改用户选择。
+            // 只监听回环并沿用安装级随机凭据，避免局域网或未认证客户端使用此入口。
+            let direct = serde_yaml::to_value(serde_json::json!({
+                "name": SUBSCRIPTION_DIRECT_LISTENER,
+                "type": "socks",
+                // Mihomo 的 SOCKS UDP 不校验 users；订阅只用 TCP，必须显式关闭 UDP。
+                "udp": false,
+                "listen": "127.0.0.1",
+                "port": self.subscription_direct_port,
+                "proxy": "DIRECT",
+                "users": [{"username": "pure-clash", "password": self.secret}],
+            }))
+            .expect("内部监听配置可序列化");
+            mapping
+                .entry(Value::from("listeners"))
+                .or_insert_with(|| Value::Sequence(Vec::new()))
+                .as_sequence_mut()
+                .expect("监听配置是列表")
+                .push(direct);
+        }
     }
+}
+
+/// 让系统选择空闲回环端口，避免固定占用用户常用的代理端口。
+fn unused_local_port() -> Result<u16> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").context("无法为订阅直连分配本机端口")?;
+    Ok(listener.local_addr()?.port())
 }
 
 /// 解析并校验本地基线 YAML。
@@ -269,6 +368,9 @@ fn parse_baseline(content: &str) -> Result<LocalBaseline> {
                 .filter_map(|item| {
                     let map = item.as_mapping()?;
                     let name = map.get("name")?.as_str()?.to_owned();
+                    if name == SUBSCRIPTION_DIRECT_LISTENER {
+                        return None;
+                    }
                     let listener_type = map.get("type")?.as_str()?.to_owned();
                     let port = map.get("port")?.as_u64()? as u16;
                     let rule = map.get("rule").and_then(Value::as_str).map(str::to_owned);
@@ -294,6 +396,14 @@ fn parse_baseline(content: &str) -> Result<LocalBaseline> {
                 .unwrap_or("rule"),
         ),
         mixed_port: mixed_port as u16,
+        subscription_direct_port: match mapping.get("subscription-direct-port") {
+            Some(port) => {
+                port.as_u64()
+                    .filter(|port| *port > 0 && *port <= u16::MAX as u64)
+                    .ok_or_else(|| anyhow::anyhow!("订阅直连端口无效"))? as u16
+            }
+            None => unused_local_port()?,
+        },
         controller_addr: controller_addr.to_owned(),
         secret: secret.to_owned(),
         tun_enable,
@@ -306,6 +416,20 @@ fn parse_baseline(content: &str) -> Result<LocalBaseline> {
 ///
 /// 返回合并后的 YAML 文本供内核 `-t` 校验；不写任何文件。
 pub(crate) fn merge_runtime(profile_yaml: &str, baseline: &LocalBaseline) -> Result<String> {
+    if baseline.subscription_direct_port == baseline.mixed_port
+        || baseline
+            .controller_addr
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            == Some(baseline.subscription_direct_port)
+        || baseline.listeners.iter().any(|listener| {
+            listener.port == baseline.subscription_direct_port
+                || listener.name == SUBSCRIPTION_DIRECT_LISTENER
+        })
+    {
+        bail!("自定义监听不能占用订阅直连入口的名称或端口");
+    }
     let profile = parse_profile(profile_yaml)?;
     let mut mapping = profile;
     baseline.insert_baseline_fields(&mut mapping);
@@ -494,6 +618,7 @@ mod tests {
         LocalBaseline {
             mode: Mode::Rule,
             mixed_port: 7890,
+            subscription_direct_port: 17899,
             controller_addr: "127.0.0.1:9097".to_owned(),
             secret: "test-secret".to_owned(),
             tun_enable: false,
@@ -1092,6 +1217,90 @@ rules:
         assert_eq!(restored.listeners[1].name, "socks-in");
         assert_eq!(restored.listeners[1].port, 7892);
         assert_eq!(restored.listeners[1].proxy.as_deref(), Some("DIRECT"));
+    }
+
+    #[test]
+    fn subscription_direct_port_is_reused_or_replaced_before_startup() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut local = baseline();
+        local.subscription_direct_port = occupied.local_addr().unwrap().port();
+        let original = local.subscription_direct_port;
+        assert!(local.reserve_subscription_direct_port().unwrap().is_none());
+        assert_eq!(local.subscription_direct_port, original);
+
+        local.tun_enable = true;
+        let reservation = local.reserve_subscription_direct_port().unwrap();
+        assert_ne!(local.subscription_direct_port, original);
+        let available = local.subscription_direct_port;
+        assert!(std::net::TcpListener::bind(("127.0.0.1", available)).is_err());
+        drop(reservation);
+        let reservation = local.reserve_subscription_direct_port().unwrap();
+        assert_eq!(local.subscription_direct_port, available);
+        drop(reservation);
+
+        // 配置中尚未启动的监听也属于冲突，不能只检查操作系统是否已经占用。
+        local.mixed_port = available;
+        let reservation = local.reserve_subscription_direct_port().unwrap();
+        assert_ne!(local.subscription_direct_port, available);
+        drop(reservation);
+        local.controller_addr = format!("127.0.0.1:{}", local.subscription_direct_port);
+        let previous = local.subscription_direct_port;
+        let reservation = local.reserve_subscription_direct_port().unwrap();
+        assert_ne!(local.subscription_direct_port, previous);
+        drop(reservation);
+        local.listeners.push(CustomListener {
+            id: "test".into(),
+            name: "test".into(),
+            listener_type: "http".into(),
+            port: local.subscription_direct_port,
+            rule: None,
+            proxy: None,
+        });
+        let previous = local.subscription_direct_port;
+        let _reservation = local.reserve_subscription_direct_port().unwrap();
+        assert_ne!(local.subscription_direct_port, previous);
+    }
+
+    #[test]
+    fn subscription_direct_port_migrates_once_and_rejects_listener_conflicts() {
+        let root = std::env::temp_dir().join(format!("pure-clash-direct-port-{}", Uuid::new_v4()));
+        let paths = AppPaths::portable(&root);
+        fs::create_dir_all(&paths.mihomo_config_dir).unwrap();
+        fs::write(
+            &paths.local_mihomo_config_file,
+            "mixed-port: 7890\nexternal-controller: 127.0.0.1:9097\nsecret: test-only\n",
+        )
+        .unwrap();
+        let mut local = ensure_baseline(&paths).unwrap();
+        assert_ne!(local.subscription_direct_port, 0);
+        assert_eq!(local, ensure_baseline(&paths).unwrap());
+        local.tun_enable = true;
+        let merged: Value =
+            serde_yaml::from_str(&merge_runtime("rules: []", &local).unwrap()).unwrap();
+        let listener = &merged["listeners"][0];
+        assert_eq!(listener["listen"], "127.0.0.1");
+        assert_eq!(listener["type"], "socks");
+        assert_eq!(listener["udp"], false);
+        assert_eq!(listener["proxy"], "DIRECT");
+        assert_eq!(listener["users"][0]["password"], "test-only");
+        assert_eq!(
+            merged["dns"]["direct-nameserver"][0],
+            "https://223.5.5.5/dns-query#DIRECT"
+        );
+        assert_eq!(parse_baseline(&local.to_yaml()).unwrap(), local);
+        local.listeners.push(CustomListener {
+            id: "test".into(),
+            name: "custom".into(),
+            listener_type: "http".into(),
+            port: local.subscription_direct_port,
+            rule: None,
+            proxy: None,
+        });
+        assert!(merge_runtime("rules: []", &local).is_err());
+        local.listeners[0].port = 7891;
+        local.listeners[0].name = SUBSCRIPTION_DIRECT_LISTENER.into();
+        assert!(merge_runtime("rules: []", &local).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

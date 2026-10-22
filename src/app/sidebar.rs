@@ -27,10 +27,28 @@ pub(super) fn render_sidebar(
         .child(
             div().px_4().pt_5().pb_4().child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_xs()
                     .font_semibold()
                     .text_color(palette.muted)
-                    .child("PURE CLASH"),
+                    .child("PURE CLASH")
+                    .children(app.update_available.then(|| {
+                        div()
+                            .id("sidebar-update-available")
+                            .px_1()
+                            .rounded_sm()
+                            .bg(gpui::rgb(0xdc2626))
+                            .text_color(gpui::rgb(0xffffff))
+                            .text_size(px(10.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(gpui::rgb(0xb91c1c)))
+                            .child(tr("about.new_badge"))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.select_page(Page::About, cx)),
+                            )
+                    })),
             ),
         )
         .child(

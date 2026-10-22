@@ -116,9 +116,10 @@ impl AppShell {
                 cx.activate(true);
                 // Linux 登录自启不弹 polkit；用户明确打开窗口后，后续启用 TUN
                 // 才允许走交互授权。内核启动本身不会等待窗口。
-                let _ = self
-                    .runtime
-                    .update(cx, |runtime, _| runtime.allow_interactive_elevation());
+                let _ = self.runtime.update(cx, |runtime, cx| {
+                    runtime.allow_interactive_elevation();
+                    runtime.check_startup_updates(cx);
+                });
             }
             Err(error) => log_error!("app", "无法创建 Pure Clash 主窗口：{error:#}"),
         }

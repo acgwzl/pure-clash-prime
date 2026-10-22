@@ -51,7 +51,7 @@
 ## Stack and commands
 
 - Rust 2024 edition. GPUI and `gpui_platform` use Zed `v1.17.2` commit `c8e44cfa7bda9b2e22c8d6934d78969352e7f61a`. `rust-i18n = 4.2.1`, Windows `tray-icon = 0.24.2`; Unix process handling uses `libc`, non-Windows directory resolution uses `directories = 6.0`.
-- Package version: `0.3.0`. The matching release tag is `v0.3.0`.
+- Package version: `0.3.1`. The matching release tag is `v0.3.1`.
 - Keep the single-package structure. Platform-neutral code stays in `src/platform/mod.rs`; add OS submodules only for real integrations.
 - Verify every Mihomo API, CLI option, and config field against the official documentation and pinned kernel. Check GPUI examples at the pinned revision before changing APIs; GPUI remains pre-1.0.
 - Run: `cargo run`. Check: `cargo check`. Tests: `cargo test`. Format: `cargo fmt --check`. Release build: `cargo build --release`.
@@ -76,6 +76,8 @@
 - Successful manual node selection persists `AppConfig.selected_nodes`: full group name to full node name, including GLOBAL; the default is an empty map. Restore choices before loading the UI snapshot on startup, mode changes, refresh, and subscription reload.
 - If the saved node still belongs to its group, use it. Otherwise temporarily select the first node in original display order without overwriting the saved choice. Skip automatic groups, empty groups, and removed groups. Identically named groups share memory across profiles.
 - Do not rely on `profile.store-selected` or kernel `cache.db`; selection must survive Linux TUN runtime reconstruction. Serialize node switching/restoration with profile updates, reject stale results, and surface errors with a refresh/retry path.
+- Controller readiness does not imply that remote proxy providers have finished loading. Refresh proxy snapshots every five seconds while the kernel runs, including with the window closed, and restore remembered selections as nodes become available. Skip background refresh during profile edits/updates and manual mode/node changes; use the existing loading lock and startup generation checks. Cache runtime group order and endpoint metadata between explicit refreshes or configuration changes.
+- `cargo test provider_nodes_refresh_after_delayed_loading_and_updates -- --ignored` uses the bundled kernel and a temporary loopback provider to check delayed loading, independent provider updates, missing-node fallback, and restoration when a remembered node returns.
 
 ## Logging
 
@@ -114,6 +116,7 @@
 
 ## System proxy and desktop integration
 
+- Check GitHub Releases once when the first main window opens in each app session. Background autostart waits until the user opens a window; reopening does not repeat the check. Ignore automatic check failures without showing errors or retrying. A newer release shows a red `new` badge after the sidebar brand that opens About. Keep manual checks in About and retain a known update badge if a later request fails.
 - Save existing proxy settings atomically to `data/system-proxy.json` before changing them. Restore on disable, kernel stop, quit, or next-start crash recovery; try restoring after a failed change. Profile-switch restarts keep proxy management in place.
 - Windows writes HKCU Internet Settings and broadcasts with InternetSetOption. Linux supports GNOME/Cinnamon via `gsettings` for HTTP/HTTPS/FTP/SOCKS; other desktops return unsupported. macOS system proxy is not implemented.
 - Windows/Linux tray menus expose Open and Quit. Click/menu/status behavior follows the active locale and actual kernel/proxy/TUN state. Windows uses the EXE icon. GNOME requires AppIndicator; where tooltips are absent, SNI Title carries status. SNI left-click often opens the menu, and Wayland activation may be refused by the compositor.
@@ -126,6 +129,9 @@
 
 ## Profiles, updates, and process matching
 
+- Subscription downloads (add, manual update, URL edits, and scheduled update) try the app's HTTP proxy first when system proxy or TUN is active, then retry once through a direct route. With neither enabled, download directly. A download failure is surfaced only after both attempts fail; invalid downloaded YAML still uses the normal validation error without another download. Disable environment proxy inheritance and redact errors before passing them to the UI.
+- While TUN is enabled, provide a dedicated authenticated SOCKS5 listener bound to `127.0.0.1` with `proxy: DIRECT` and `udp: false`; Mihomo's SOCKS UDP path does not enforce user authentication. This bypasses ordinary rules and global proxy selection without changing mode or stopping TUN. Persist its OS-allocated port in `local.yaml` as `subscription-direct-port`, reserve the listener name/port, and exclude it from user listener settings. Before starting a stopped kernel, retain an available port or replace an occupied one, validate the resulting runtime, and save both files with rollback on failure. Do not reallocate during hot reload. Once TUN is ready, check authenticated forwarding through the dedicated listener to the local controller; a failed check keeps TUN running but blocks subscription DIRECT retry with an error, never falling back to an ordinary system request. Reuse the installation secret for local authentication; never log the authenticated proxy URL. Use ureq's `socks-proxy` feature so authentication is separate from HTTP headers, including across redirects. TUN DIRECT hostname resolution uses `https://223.5.5.5/dns-query#DIRECT` with `direct-nameserver-follow-policy=false`, including other DIRECT traffic. Ordinary DNS queries retain their existing policy.
+- `cargo test subscription_download_` covers proxy preference, direct retry, combined failures, and redaction with loopback HTTP servers. `cargo test subscription_direct_retry_bypasses_global_and_rule_modes -- --ignored` validates the production config with bundled Mihomo and checks authenticated DIRECT retry against REJECT in rule/global modes without enabling system TUN.
 - The built-in DIRECT profile is first and selected when `active_profile` is empty. Switching to it uses the same validation pipeline. URL downloads and local YAML imports share structural checks, same-kernel validation, atomic saving, and activation. Local imports save a content copy, not the source path or its relative resources. Both sources have a 10 MB UTF-8 limit.
 - Manual activation/update restarts the real kernel. Controller mode/selection APIs use `PATCH /configs` and `GET/PUT /proxies`. Latency tests use proxy/group delay endpoints, a gstatic 204 target, and five-second probes; manual results override historical values.
 - Connections are polled every second through `GET /connections`; byte deltas produce current speeds. Support individual/all DELETE operations and render at most 200 rows. Accept `connections:null`; delay zero means failure.

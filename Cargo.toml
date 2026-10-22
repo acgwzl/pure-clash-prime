@@ -1,6 +1,6 @@
 [package]
 name = "pure-clash"
-version = "0.3.4"
+version = "0.3.1"
 edition = "2024"
 description = "A lightweight Mihomo desktop client built with Rust and Zed GPUI"
 license = "GPL-3.0"
@@ -86,7 +86,7 @@ serde_yaml = "0.9"
 # 校验随包与在线更新的 Geo 数据，防止损坏文件进入运行目录。
 sha2 = "0.10"
 # 订阅下载与 controller REST 调用；rustls TLS，阻塞式跑在 GPUI 后台线程。
-ureq = { version = "2.10", features = ["json"] }
+ureq = { version = "2.10", features = ["json", "socks-proxy"] }
 # 生成配置文件随机 secret 与订阅 profile 标识。
 uuid = { version = "1.0", features = ["v4"] }
 # 文本输入组件的字素边界处理（与 gpui 官方 input 示例一致）。

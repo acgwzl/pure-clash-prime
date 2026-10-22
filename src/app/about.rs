@@ -9,6 +9,7 @@ use crate::theme::{FontWeightExt, Palette};
 
 /// 源码仓库地址；发布仓库变动时请同步更新 [`RELEASES_API_URL`]。
 const SOURCE_CODE_URL: &str = "https://github.com/prime-zt/pure-clash";
+const RELEASES_URL: &str = "https://github.com/prime-zt/pure-clash/releases/latest";
 /// 最新版本查询端点（GitHub Releases API）。
 const RELEASES_API_URL: &str = "https://api.github.com/repos/prime-zt/pure-clash/releases/latest";
 
@@ -99,7 +100,7 @@ pub(super) fn render_about(
                         .text_sm()
                         .text_color(palette.accent)
                         .child(SOURCE_CODE_URL)
-                        .on_click(|_, _, _| open_source_code_url()),
+                        .on_click(|_, _, _| open_project_url(SOURCE_CODE_URL)),
                 )
                 .child(
                     div()
@@ -128,7 +129,9 @@ pub(super) fn render_about(
                                 .font_medium()
                                 .text_color(palette.surface)
                                 .child(tr("about.check_updates"))
-                                .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.check_for_updates(false, cx)),
+                                ),
                         )
                         .children(app.update_checking.then(|| {
                             div()
@@ -138,14 +141,19 @@ pub(super) fn render_about(
                         }))
                         .children(app.update_status.as_ref().map(|status| {
                             // 发现新版本时用主题色强调，其余结果保持弱化展示。
-                            let highlighted = app.update_available;
+                            let highlighted = app.update_status_is_release;
                             div()
+                                .id("about-update-status")
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
                                 .map(|text| {
                                     if highlighted {
-                                        text.font_medium().text_color(palette.accent)
+                                        text.font_medium()
+                                            .text_color(palette.accent)
+                                            .cursor_pointer()
+                                            .hover(|style| style.text_color(palette.text))
+                                            .on_click(|_, _, _| open_project_url(RELEASES_URL))
                                     } else {
                                         text.text_color(palette.muted)
                                     }
@@ -211,19 +219,17 @@ pub(super) fn render_about(
         .into_any_element()
 }
 
-/// 在系统默认浏览器中打开源码仓库。
-fn open_source_code_url() {
+/// 在系统默认浏览器中打开项目仓库或发布页面；地址仅来自本文件常量。
+fn open_project_url(url: &str) {
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", SOURCE_CODE_URL])
+            .args(["/C", "start", "", url])
             .spawn();
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(SOURCE_CODE_URL)
-            .spawn();
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
 

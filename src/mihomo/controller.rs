@@ -70,6 +70,20 @@ impl Controller {
         Ok(value.version)
     }
 
+    /// 经专用 SOCKS 入口访问本机 controller，确认认证和 TCP 转发均可用，不访问外网。
+    pub(crate) fn check_subscription_direct(&self, proxy: &str) -> Result<()> {
+        let mut direct = self.clone();
+        direct.agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .timeout_connect(Duration::from_secs(1))
+            .timeout(Duration::from_secs(1))
+            .redirects(0)
+            .proxy(ureq::Proxy::new(proxy).context("订阅直连入口地址无效")?)
+            .build();
+        direct.version().context("订阅直连入口不可用")?;
+        Ok(())
+    }
+
     /// 读取当前运行配置摘要；目前客户端只关心运行模式。
     pub(crate) fn configs(&self) -> Result<ConfigSnapshot> {
         #[derive(Deserialize)]
@@ -282,11 +296,16 @@ impl Controller {
     }
 
     /// 下载订阅内容；带体积上限，返回 UTF-8 文本。
-    pub(crate) fn download_subscription(url: &str) -> Result<String> {
-        let agent = ureq::AgentBuilder::new()
+    pub(crate) fn download_subscription(url: &str, proxy: Option<&str>) -> Result<String> {
+        // 显式选择此轮出口，不继承进程环境中的代理；TUN 直连由专用 DIRECT 入口承担。
+        let mut builder = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
             .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build();
+            .timeout(Duration::from_secs(60));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(ureq::Proxy::new(proxy).context("订阅下载代理地址无效")?);
+        }
+        let agent = builder.build();
         let response = agent
             .get(url)
             .set("User-Agent", "clash.meta/pure-clash")
@@ -760,6 +779,176 @@ mod tests {
             .unwrap();
         assert_eq!(selected("手动组"), "REJECT");
         process.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "使用随包 Mihomo 验证 provider 延迟加载和更新；仅使用临时回环服务"]
+    fn provider_nodes_refresh_after_delayed_loading_and_updates() {
+        use crate::{
+            mihomo::{MihomoProcess, config::ensure_baseline},
+            platform::AppPaths,
+        };
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            path::PathBuf,
+            sync::mpsc,
+            thread,
+            time::Instant,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "pure-clash-provider-refresh-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut paths = AppPaths::portable(&root);
+        paths.kernel_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel");
+        fs::create_dir_all(&paths.mihomo_config_dir).unwrap();
+        fs::create_dir_all(&paths.mihomo_data_dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut baseline = ensure_baseline(&paths).unwrap();
+        baseline.controller_addr = address.to_string();
+        let controller = Controller::new(&baseline);
+
+        let provider = TcpListener::bind("127.0.0.1:0").unwrap();
+        let provider_address = provider.local_addr().unwrap();
+        provider.set_nonblocking(true).unwrap();
+        let (requested_tx, requested_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            for (index, names) in [
+                ["DEMO-A", "DEMO-B"],
+                ["DEMO-C", "DEMO-D"],
+                ["DEMO-A", "DEMO-B"],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match provider.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "provider 请求超时");
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(error) => panic!("provider 接收失败：{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if index == 0 {
+                    // 先让 controller 可用，暂不返回节点，稳定重现启动时的空快照。
+                    requested_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+                let body = format!(
+                    "proxies:\n- {{name: {}, type: socks5, server: 192.0.2.1, port: 443}}\n- {{name: {}, type: socks5, server: 192.0.2.2, port: 443}}\n",
+                    names[0], names[1]
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        // 不开启代理监听、DNS 或 TUN；节点为文档保留地址，也不进行测速。
+        let runtime = format!(
+            "mixed-port: 0\nexternal-controller: {address}\nsecret: {}\nmode: rule\nprofile:\n  store-selected: false\nproxy-providers:\n  demo:\n    type: http\n    url: http://{provider_address}/provider.yaml\n    path: ./provider.yaml\n    interval: 3600\n    health-check:\n      enable: false\nproxy-groups:\n- name: DEMO-GROUP\n  type: select\n  use: [demo]\nrules:\n- MATCH,DIRECT\n",
+            baseline.secret
+        );
+        fs::write(&paths.runtime_mihomo_config_file, runtime).unwrap();
+        let mut process = MihomoProcess::start(
+            &paths,
+            env!("PURE_CLASH_DEFAULT_MIHOMO_VERSION"),
+            &paths.runtime_mihomo_config_file,
+            false,
+            true,
+        )
+        .unwrap();
+        requested_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        controller.version().unwrap();
+        let selections = BTreeMap::from([("DEMO-GROUP".into(), "DEMO-B".into())]);
+        // 与应用同步路径相同：先恢复记忆，再读取当前模式和代理快照。
+        let refresh = || {
+            controller.restore_proxy_selections(&selections).unwrap();
+            let mode = controller.configs().unwrap().mode;
+            controller
+                .proxies(mode)
+                .unwrap()
+                .groups
+                .into_iter()
+                .find(|group| group.name == "DEMO-GROUP")
+                .unwrap()
+        };
+        let early = refresh();
+        assert_eq!(
+            early
+                .nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["COMPATIBLE"]
+        );
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let group = refresh();
+            if group.now == "DEMO-B" {
+                assert_eq!(
+                    group
+                        .nodes
+                        .iter()
+                        .map(|node| node.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["DEMO-A", "DEMO-B"]
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "provider 加载后未恢复记忆节点");
+            thread::sleep(Duration::from_millis(50));
+        }
+        for (members, selected) in [
+            (["DEMO-C", "DEMO-D"], "DEMO-C"),
+            (["DEMO-A", "DEMO-B"], "DEMO-B"),
+        ] {
+            // provider 独立更新，不重载配置、不重启内核，也不修改用户记忆。
+            controller
+                .agent
+                .put(&format!("{}/providers/proxies/demo", controller.base_url))
+                .set("Authorization", &controller.authorization())
+                .call()
+                .unwrap();
+            let group = refresh();
+            assert_eq!(
+                group
+                    .nodes
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                members
+            );
+            assert_eq!(group.now, selected);
+            assert_eq!(selections["DEMO-GROUP"], "DEMO-B");
+        }
+        process.stop().unwrap();
+        server.join().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
