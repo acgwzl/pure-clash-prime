@@ -23,7 +23,8 @@ Pure Clash 通过简洁、快速的原生界面管理配置订阅、代理分组
 - **离线 Geo 数据库**：安装包包含 `GeoSite.dat`、`GeoIP.dat` 和 `Country.mmdb`，可在不联网时从随包资源恢复，也可在设置页手动更新。
 - **代理分组与测速**：按分组展示订阅节点，通过 controller 实时切换规则、全局和直连模式；支持单节点和整组测速，按延迟区间显示不同颜色。
 - **连接与实时流量**：每秒通过 controller 获取连接快照，展示进程、目标、代理链、规则及每条连接的上传和下载流量；支持关闭单条或全部连接，概览页显示实时网速和活跃连接。
-- **系统代理**：Windows 写入当前用户的 Internet Settings，并通过 WinINet 通知系统；Linux 通过 `gsettings` 支持 GNOME/Cinnamon 会话。开启前原子保存用户原有设置，在关闭代理、停止内核或崩溃恢复时还原。
+- **自定义入站监听**：支持在默认混合端口之外配置多个 `http`、`socks`、`mixed` 监听，每个监听可独立指定路由模式（跟随全局、规则、全局、直连），保存后通过 `-t` 校验并自动重载内核与系统代理。
+- **系统代理**：Windows 写入当前用户的 Internet Settings，并通过 WinINet 通知系统；Linux 通过 `gsettings` 支持 GNOME/Cinnamon 会话，并通过 `kwriteconfig`/`kioslaverc` 自动兼容 KDE Plasma（5/6），支持按自定义监听独立分发 HTTP 与 SOCKS 端口。开启前原子保存用户原有设置，在关闭代理、停止内核或崩溃恢复时还原。
 - **TUN 模式**：Windows 通过 UAC 提权启动内核，并使用随包提供的 wintun；Linux 参考 Clash Verge Rev 的服务模型，首次通过 `pkexec` 安装 root systemd 服务，之后通过按 UID 限制的 IPC 启停，无需重复输入密码；TUN 未生效时自动回退。
 - **桌面集成**：托盘图标及多语言实时状态、单实例锁、关闭窗口后驻留托盘、深浅色主题、中英文界面。
 - **低内存占用**：桌面客户端自身的内存占用通常低于 30 MB，不含 Mihomo 内核。
@@ -39,7 +40,7 @@ Pure Clash 通过简洁、快速的原生界面管理配置订阅、代理分组
 | 内核启停与守护 | ✅ | ✅ | 已预留 |
 | 配置与代理控制 | ✅ | ✅ | 已预留 |
 | 连接与实时流量 | ✅ | ✅ | 已预留 |
-| 系统代理 | ✅ | ✅ GNOME/Cinnamon | 未实现 |
+| 系统代理 | ✅ | ✅ GNOME/Cinnamon/KDE | 未实现 |
 | TUN 模式 | ✅ UAC + wintun | ✅ polkit + root 服务 | 未实现 |
 | 托盘 | ✅ | ✅ SNI（GNOME 需要 AppIndicator 扩展） | 未实现 |
 | 单实例 | ✅ | ✅ | 未实现 |
@@ -120,7 +121,7 @@ Geo 数据快照通过 `geodata/manifest.json` 独立锁定到 MetaCubeX 官方�
 ## 后续计划
 
 - 规则页及日志、内存监控（controller `/rules`、`/logs`、`/memory`）。
-- Linux 凭据存储，以及 KDE 等其他桌面的系统代理支持。
+- Linux 凭据存储，以及除 GNOME/Cinnamon/KDE 外的更多桌面环境系统代理支持。
 - 完整 macOS 支持，包括内核守护、窗口行为和 TUN 权限边界。
 - 代码签名和更新渠道。
 

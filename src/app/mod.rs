@@ -9,7 +9,7 @@ use crate::{
         ICON_EYE, ICON_EYE_OFF, ICON_FILE_CODE, ICON_GIT_BRANCH, ICON_INFO, ICON_LAYOUT,
         ICON_MESSAGE, ICON_SETTINGS,
     },
-    config::{AppConfig, Language, LoadedConfig, ProfileMeta},
+    config::{AppConfig, CustomListener, Language, LoadedConfig, ProfileMeta},
     kernel::is_available,
     mihomo::{
         MihomoProcess,
@@ -20,6 +20,7 @@ use crate::{
         config::read_proxy_group_order,
         config::save_baseline,
         config::validate_kernel_config,
+        config::validate_listeners,
         config::write_runtime,
         controller::{
             ConnectionItem, ConnectionsSnapshot, Controller, GroupSnapshot, Mode, NodeSnapshot,
@@ -28,7 +29,7 @@ use crate::{
     },
     platform::{
         AppPaths, AutoStartStatus, SystemProxySnapshot, autostart_status, capture_system_proxy,
-        restore_system_proxy, set_autostart, set_system_proxy,
+        restore_system_proxy, set_autostart, set_system_proxy_endpoints,
     },
     profile,
     startup::StartupMode,
@@ -325,6 +326,11 @@ pub(crate) struct PureClash {
     update_available: bool,
     /// 关于页检查更新的结果文案；None 表示尚未检查。
     update_status: Option<SharedString>,
+    /// 自定义监听添加表单的输入状态。
+    listener_form_name: Entity<TextInput>,
+    listener_form_port: Entity<TextInput>,
+    listener_form_type: String,
+    listener_form_rule: Option<String>,
 }
 
 impl PureClash {
@@ -361,14 +367,22 @@ impl PureClash {
                 None
             }
         };
-        // 强制进程名开关以 app.json 为唯一事实来源：启动时把开关对齐到基线，
-        // 后续 runtime 生成的 `find-process-mode` 便与界面状态一致。
-        if let Some(baseline) = baseline.as_mut()
-            && baseline.find_process_always != config.find_process_always
-        {
-            baseline.find_process_always = config.find_process_always;
-            if let Err(error) = save_baseline(&paths, baseline) {
-                log_error!("core", "同步进程匹配开关到本地基线失败：{error:#}");
+        // 强制进程名开关与自定义监听以 app.json 为唯一事实来源：启动时对齐到基线，
+        // 后续 runtime 生成便与界面状态一致。
+        if let Some(baseline) = baseline.as_mut() {
+            let mut baseline_dirty = false;
+            if baseline.find_process_always != config.find_process_always {
+                baseline.find_process_always = config.find_process_always;
+                baseline_dirty = true;
+            }
+            if baseline.listeners != config.listeners {
+                baseline.listeners = config.listeners.clone();
+                baseline_dirty = true;
+            }
+            if baseline_dirty {
+                if let Err(error) = save_baseline(&paths, baseline) {
+                    log_error!("core", "同步应用配置到本地基线失败：{error:#}");
+                }
             }
         }
 
@@ -411,6 +425,8 @@ impl PureClash {
         let profile_edit_url = cx.new(|cx| TextInput::new(t!("profiles.url_placeholder"), cx));
         let profile_form_interval =
             cx.new(|cx| TextInput::new(t!("profiles.interval_placeholder"), cx));
+        let listener_form_name = cx.new(|cx| TextInput::new(t!("settings.listener_name"), cx));
+        let listener_form_port = cx.new(|cx| TextInput::new("7891", cx));
         let profiles = config.profiles.clone();
         let (autostart_enabled, autostart_available) = match autostart_status() {
             Ok(AutoStartStatus::Enabled) => (true, true),
@@ -486,6 +502,10 @@ impl PureClash {
             update_checking: false,
             update_available: false,
             update_status: None,
+            listener_form_name,
+            listener_form_port,
+            listener_form_type: "http".to_owned(),
+            listener_form_rule: None,
         };
         // 开机即按上次记录的激活配置启动内核；失败时只在界面提示，不阻断打开。
         // 新 runtime 未经校验或未能原子提交时不得沿用磁盘上的旧文件启动。
@@ -1072,6 +1092,7 @@ impl PureClash {
     fn spawn_readiness_probe(&mut self, generation: u64, cx: &mut Context<Self>) {
         let Some(controller) = self.controller() else {
             self.core_state = CoreState::Running;
+            self.restore_system_proxy_if_configured();
             return;
         };
         cx.spawn(async move |this, cx| {
@@ -1100,6 +1121,7 @@ impl PureClash {
                         this.mihomo_error = None;
                         this.fetch_runtime_state(cx);
                         this.verify_tun_effective(generation, cx);
+                        this.restore_system_proxy_if_configured();
                     }
                     Err(error) => {
                         // 内核未能就绪：先恢复代理设置再回收进程，避免流量断在死端口上。
@@ -1542,6 +1564,58 @@ impl PureClash {
         self.stop_core();
     }
 
+    /// 获取当前系统代理的 HTTP 地址与可选的 SOCKS 地址（优先使用自定义监听配置）。
+    fn current_proxy_endpoints(&self) -> (String, Option<String>) {
+        let mixed_port = self.baseline.as_ref().map_or(7890, |b| b.mixed_port);
+        let mut http_port = None;
+        let mut socks_port = None;
+
+        for l in &self.config.listeners {
+            match l.listener_type.as_str() {
+                "http" if http_port.is_none() => http_port = Some(l.port),
+                "socks" if socks_port.is_none() => socks_port = Some(l.port),
+                "mixed" => {
+                    if http_port.is_none() {
+                        http_port = Some(l.port);
+                    }
+                    if socks_port.is_none() {
+                        socks_port = Some(l.port);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let http = format!("127.0.0.1:{}", http_port.unwrap_or(mixed_port));
+        let socks = socks_port.map(|p| format!("127.0.0.1:{p}"));
+        (http, socks)
+    }
+
+    /// 内核就绪后按配置恢复系统代理设置（如上次退出前用户开启了系统代理）。
+    fn restore_system_proxy_if_configured(&mut self) {
+        if self.config.system_proxy && !self.system_proxy {
+            log_info!("proxy", "检测到配置中开启了系统代理，内核就绪后自动应用");
+            if let Err(error) = self.enable_system_proxy_endpoints() {
+                log_error!("proxy", "启动时自动开启系统代理失败：{error:#}");
+                self.integration_error = Some(system_proxy_error(&error));
+            }
+        }
+    }
+
+    /// 启用系统代理并保存托管前的系统设置快照。
+    fn enable_system_proxy_endpoints(&mut self) -> anyhow::Result<()> {
+        let (http_addr, socks_addr) = self.current_proxy_endpoints();
+        log_info!(
+            "proxy",
+            "开启系统代理（HTTP: {http_addr}, SOCKS: {:?}）",
+            socks_addr
+        );
+        enable_system_proxy(&self.paths, &http_addr, socks_addr.as_deref())?;
+        self.integration_error = None;
+        self.system_proxy = true;
+        Ok(())
+    }
+
     /// 开关系统代理：启用要求内核运行中；关闭恢复托管前的用户设置。
     fn toggle_system_proxy(&mut self, cx: &mut Context<Self>) {
         if !self.system_proxy {
@@ -1550,17 +1624,12 @@ impl PureClash {
                 cx.notify();
                 return;
             }
-            let Some(baseline) = self.baseline.clone() else {
-                self.integration_error = Some(t!("app.baseline_missing").into_owned());
-                cx.notify();
-                return;
-            };
-            let addr = format!("127.0.0.1:{}", baseline.mixed_port);
-            log_info!("proxy", "开启系统代理（{addr}）");
-            match enable_system_proxy(&self.paths, &addr) {
+            match self.enable_system_proxy_endpoints() {
                 Ok(()) => {
-                    self.integration_error = None;
-                    self.system_proxy = true;
+                    self.config.system_proxy = true;
+                    if let Err(error) = self.config.save(&self.paths.config_file) {
+                        log_error!("config", "保存系统代理配置失败：{error:#}");
+                    }
                 }
                 Err(error) => {
                     log_error!("proxy", "开启系统代理失败：{error:#}");
@@ -1569,6 +1638,10 @@ impl PureClash {
             }
         } else {
             self.disable_system_proxy();
+            self.config.system_proxy = false;
+            if let Err(error) = self.config.save(&self.paths.config_file) {
+                log_error!("config", "保存系统代理配置失败：{error:#}");
+            }
         }
         cx.notify();
     }
@@ -1804,6 +1877,194 @@ impl PureClash {
             .detach();
         }
         Ok(())
+    }
+
+    /// 保存自定义监听列表并重载内核与系统代理。
+    fn save_listeners_and_reload(
+        &mut self,
+        listeners: Vec<CustomListener>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let Some(previous_baseline) = self.baseline.clone() else {
+            anyhow::bail!(t!("app.baseline_missing").into_owned());
+        };
+
+        // 端口冲突与合法性校验
+        validate_listeners(
+            previous_baseline.mixed_port,
+            &previous_baseline.controller_addr,
+            &listeners,
+        )?;
+
+        let previous_listeners = self.config.listeners.clone();
+        let mut desired_baseline = previous_baseline.clone();
+        desired_baseline.listeners = listeners.clone();
+
+        // 校验 runtime 合并及内核 -t
+        let runtime = profile::prepare_runtime(
+            &self.paths,
+            Some(&desired_baseline),
+            &self.config.mihomo_version,
+            self.active_profile.as_deref(),
+        )?;
+
+        // 持久化 app.json
+        self.config.listeners = listeners;
+        if let Err(error) = self.config.save(&self.paths.config_file) {
+            self.config.listeners = previous_listeners;
+            return Err(error);
+        }
+
+        // 持久化 local.yaml 与 runtime.yaml
+        if let Err(error) = save_baseline(&self.paths, &desired_baseline) {
+            self.config.listeners = previous_listeners;
+            let _ = self.config.save(&self.paths.config_file);
+            return Err(error);
+        }
+
+        if let Err(error) = write_runtime(&self.paths, &runtime) {
+            self.config.listeners = previous_listeners;
+            let _ = self.config.save(&self.paths.config_file);
+            let _ = save_baseline(&self.paths, &previous_baseline);
+            return Err(error);
+        }
+
+        self.baseline = Some(desired_baseline);
+        log_info!("app", "自定义监听配置已更新并持久化");
+
+        // 若内核运行或活跃，重启内核以应用新端口与监听
+        if self.core_active() {
+            self.restart_core(cx);
+        }
+
+        // 若系统代理正在运行，按新的监听端口重新生效
+        if self.system_proxy {
+            let (http_addr, socks_addr) = self.current_proxy_endpoints();
+            log_info!(
+                "proxy",
+                "刷新系统代理指向（HTTP: {http_addr}, SOCKS: {:?}）",
+                socks_addr
+            );
+            if let Err(error) = set_system_proxy_endpoints(&http_addr, socks_addr.as_deref()) {
+                log_error!("proxy", "重载监听后刷新系统代理失败：{error:#}");
+                self.integration_error = Some(system_proxy_error(&error));
+            }
+        }
+
+        cx.notify();
+        Ok(())
+    }
+
+    pub(super) fn set_listener_form_type(&mut self, listener_type: String, cx: &mut Context<Self>) {
+        self.listener_form_type = listener_type;
+        cx.notify();
+    }
+
+    pub(super) fn set_listener_form_rule(&mut self, rule: Option<String>, cx: &mut Context<Self>) {
+        self.listener_form_rule = rule;
+        cx.notify();
+    }
+
+    pub(super) fn add_custom_listener(&mut self, cx: &mut Context<Self>) {
+        let port_str = self.listener_form_port.read(cx).content().trim().to_owned();
+        let Ok(port) = port_str.parse::<u16>() else {
+            self.integration_error = Some(
+                t!(
+                    "settings.listener_conflict",
+                    error = format!("invalid port: {port_str}")
+                )
+                .into_owned(),
+            );
+            cx.notify();
+            return;
+        };
+
+        let mut name = self.listener_form_name.read(cx).content().trim().to_owned();
+        if name.is_empty() {
+            name = format!("{}-{port}", self.listener_form_type);
+        }
+
+        let id = format!(
+            "ls-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        );
+
+        let new_listener = CustomListener {
+            id,
+            name,
+            listener_type: self.listener_form_type.clone(),
+            port,
+            rule: self.listener_form_rule.clone(),
+            proxy: None,
+        };
+
+        let mut listeners = self.config.listeners.clone();
+        listeners.push(new_listener);
+
+        match self.save_listeners_and_reload(listeners, cx) {
+            Ok(()) => {
+                self.integration_error = None;
+                self.listener_form_name
+                    .update(cx, |input, cx| input.set_content(String::new(), cx));
+                self.listener_form_port
+                    .update(cx, |input, cx| input.set_content(String::new(), cx));
+            }
+            Err(error) => {
+                self.integration_error = Some(
+                    t!(
+                        "settings.listener_conflict",
+                        error = concise_error(&format!("{error:#}"), 140)
+                    )
+                    .into_owned(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn remove_custom_listener(&mut self, id: String, cx: &mut Context<Self>) {
+        let mut listeners = self.config.listeners.clone();
+        listeners.retain(|l| l.id != id);
+        if let Err(error) = self.save_listeners_and_reload(listeners, cx) {
+            self.integration_error = Some(
+                t!(
+                    "settings.listener_conflict",
+                    error = concise_error(&format!("{error:#}"), 140)
+                )
+                .into_owned(),
+            );
+        } else {
+            self.integration_error = None;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn update_custom_listener_rule(
+        &mut self,
+        id: String,
+        rule: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut listeners = self.config.listeners.clone();
+        if let Some(target) = listeners.iter_mut().find(|l| l.id == id) {
+            target.rule = rule;
+        } else {
+            return;
+        }
+        if let Err(error) = self.save_listeners_and_reload(listeners, cx) {
+            self.integration_error = Some(
+                t!(
+                    "settings.listener_conflict",
+                    error = concise_error(&format!("{error:#}"), 140)
+                )
+                .into_owned(),
+            );
+        } else {
+            self.integration_error = None;
+        }
+        cx.notify();
     }
 
     /// 保存模式到基线和运行时配置；写入失败保留原基线，供用户重试。
@@ -2835,21 +3096,23 @@ impl PureClash {
 impl Render for PureClash {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.palette();
-        let content = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .text_color(palette.text)
-            .child(render_titlebar(self, palette, window, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(render_sidebar(self, palette, window, cx))
-                    .child(render_page(self, palette, window, cx)),
-            );
+        let content = crate::platform::apply_ui_font(
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .text_color(palette.text)
+                .child(render_titlebar(self, palette, window, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .child(render_sidebar(self, palette, window, cx))
+                        .child(render_page(self, palette, window, cx)),
+                ),
+        );
 
         #[cfg(target_os = "linux")]
         return linux_client_side_decorations(content, palette, window);
@@ -2892,7 +3155,11 @@ fn clear_system_proxy_state(paths: &AppPaths) {
 }
 
 /// 启用系统代理，捕获并返回托管前的用户设置快照。
-fn enable_system_proxy(paths: &AppPaths, server: &str) -> anyhow::Result<()> {
+fn enable_system_proxy(
+    paths: &AppPaths,
+    http_server: &str,
+    socks_server: Option<&str>,
+) -> anyhow::Result<()> {
     let snapshot = capture_system_proxy().inspect_err(|error| {
         log_error!("proxy", "捕获用户既有系统代理设置失败：{error:#}");
     })?;
@@ -2901,7 +3168,7 @@ fn enable_system_proxy(paths: &AppPaths, server: &str) -> anyhow::Result<()> {
     save_system_proxy_state(paths, &snapshot).inspect_err(|error| {
         log_error!("proxy", "系统代理托管状态文件落盘失败：{error:#}");
     })?;
-    if let Err(apply_error) = set_system_proxy(server) {
+    if let Err(apply_error) = set_system_proxy_endpoints(http_server, socks_server) {
         log_error!("proxy", "写入系统代理设置失败：{apply_error:#}");
         match restore_system_proxy(&snapshot) {
             Ok(()) => clear_system_proxy_state(paths),

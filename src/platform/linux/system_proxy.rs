@@ -1,8 +1,7 @@
-//! Linux 桌面系统代理：通过 GNOME/Cinnamon 的 GSettings schema 管理当前会话。
+//! Linux 桌面系统代理：通过 GNOME/Cinnamon 的 GSettings schema 或 KDE Plasma 的
+//! kioslaverc 配置管理当前桌面会话。
 //!
-//! GSettings 是 GNOME、Cinnamon 及使用 GLib 代理解析器的应用读取系统代理的
-//! 标准入口。写入前保存所有会修改键的原始 GVariant 文本，恢复时逐项原样写回，
-//! 因而能够保留用户原来的 `none` / `manual` / `auto` 模式及各协议端点。
+//! 写入前保存所有修改键的原始文本，恢复时逐项原样写回，保留用户原来的代理模式及各协议端点。
 
 use std::{env, net::SocketAddr, process::Command};
 
@@ -25,57 +24,178 @@ const PROXY_KEYS: [(&str, &str); 11] = [
     ("socks", "port"),
 ];
 
+const KDE_PROXY_GROUP: &str = "Proxy Settings";
+const KDE_PROXY_KEYS: [&str; 6] = [
+    "ProxyType",
+    "httpProxy",
+    "httpsProxy",
+    "ftpProxy",
+    "socksProxy",
+    "NoProxyFor",
+];
+
+enum DesktopKind {
+    GSettings(String),
+    Kde(KdeTool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KdeTool {
+    Kde6,
+    Kde5,
+}
+
+impl KdeTool {
+    fn write_cmd(self) -> &'static str {
+        match self {
+            Self::Kde6 => "kwriteconfig6",
+            Self::Kde5 => "kwriteconfig5",
+        }
+    }
+
+    fn read_cmd(self) -> &'static str {
+        match self {
+            Self::Kde6 => "kreadconfig6",
+            Self::Kde5 => "kreadconfig5",
+        }
+    }
+}
+
 /// 捕获当前桌面会话的完整代理设置，供关闭和异常恢复时原样还原。
 pub(crate) fn capture_system_proxy() -> Result<SystemProxySnapshot> {
-    let prefix = detect_schema()?;
-    let settings = PROXY_KEYS
-        .iter()
-        .map(|(suffix, key)| {
-            let schema = schema_name(&prefix, suffix);
-            Ok(LinuxProxySetting {
-                value: gsettings_get(&schema, key)?,
-                schema,
-                key: (*key).to_owned(),
+    match detect_desktop_kind()? {
+        DesktopKind::GSettings(prefix) => {
+            let settings = PROXY_KEYS
+                .iter()
+                .map(|(suffix, key)| {
+                    let schema = schema_name(&prefix, suffix);
+                    Ok(LinuxProxySetting {
+                        value: gsettings_get(&schema, key)?,
+                        schema,
+                        key: (*key).to_owned(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(SystemProxySnapshot {
+                managed: true,
+                prev_enabled: false,
+                prev_server: String::new(),
+                linux: Some(LinuxSystemProxySnapshot {
+                    backend: "gsettings".to_string(),
+                    schema_prefix: prefix,
+                    settings,
+                }),
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        }
+        DesktopKind::Kde(tool) => {
+            let settings = KDE_PROXY_KEYS
+                .iter()
+                .map(|key| {
+                    let value = kde_read_config(tool, KDE_PROXY_GROUP, key).unwrap_or_default();
+                    LinuxProxySetting {
+                        schema: KDE_PROXY_GROUP.to_string(),
+                        key: (*key).to_string(),
+                        value,
+                    }
+                })
+                .collect();
 
-    Ok(SystemProxySnapshot {
-        managed: true,
-        prev_enabled: false,
-        prev_server: String::new(),
-        linux: Some(LinuxSystemProxySnapshot {
-            schema_prefix: prefix,
-            settings,
-        }),
-    })
-}
-
-/// 将 HTTP、HTTPS、FTP 与 SOCKS 全部指向 Mihomo mixed-port，最后再切换为
-/// manual，避免写入中途让桌面应用看到半配置状态。
-pub(crate) fn set_system_proxy(server: &str) -> Result<()> {
-    let prefix = detect_schema()?;
-    let (host, port) = parse_proxy_server(server)?;
-    let host = gvariant_string(&host);
-    let port = port.to_string();
-
-    for protocol in ["http", "https", "ftp", "socks"] {
-        let schema = schema_name(&prefix, protocol);
-        gsettings_set(&schema, "host", &host)?;
-        gsettings_set(&schema, "port", &port)?;
+            Ok(SystemProxySnapshot {
+                managed: true,
+                prev_enabled: false,
+                prev_server: String::new(),
+                linux: Some(LinuxSystemProxySnapshot {
+                    backend: "kde".to_string(),
+                    schema_prefix: String::new(),
+                    settings,
+                }),
+            })
+        }
     }
-    gsettings_set(&schema_name(&prefix, "http"), "use-authentication", "false")?;
-    gsettings_set(&prefix, "use-same-proxy", "false")?;
-    gsettings_set(&prefix, "mode", "'manual'")
 }
 
-/// 按状态文件中的原始 GVariant 文本恢复全部设置；模式最后恢复，降低切换期间
-/// 使用错误端点的概率。
+/// 将系统代理指向指定的监听端点（支持独立 http/socks 端点，未独立指定时回退到统一 server）。
+pub(crate) fn set_system_proxy_endpoints(
+    http_server: &str,
+    socks_server: Option<&str>,
+) -> Result<()> {
+    match detect_desktop_kind()? {
+        DesktopKind::GSettings(prefix) => {
+            let (http_host, http_port) = parse_proxy_server(http_server)?;
+            let http_host_val = gvariant_string(&http_host);
+            let http_port_val = http_port.to_string();
+
+            let (socks_host_val, socks_port_val) = if let Some(socks_server) = socks_server {
+                let (socks_host, socks_port) = parse_proxy_server(socks_server)?;
+                (gvariant_string(&socks_host), socks_port.to_string())
+            } else {
+                (http_host_val.clone(), http_port_val.clone())
+            };
+
+            for protocol in ["http", "https", "ftp"] {
+                let schema = schema_name(&prefix, protocol);
+                gsettings_set(&schema, "host", &http_host_val)?;
+                gsettings_set(&schema, "port", &http_port_val)?;
+            }
+            let socks_schema = schema_name(&prefix, "socks");
+            gsettings_set(&socks_schema, "host", &socks_host_val)?;
+            gsettings_set(&socks_schema, "port", &socks_port_val)?;
+
+            gsettings_set(&schema_name(&prefix, "http"), "use-authentication", "false")?;
+            gsettings_set(&prefix, "use-same-proxy", "false")?;
+            gsettings_set(&prefix, "mode", "'manual'")
+        }
+        DesktopKind::Kde(tool) => {
+            let (http_host, http_port) = parse_proxy_server(http_server)?;
+            let (socks_host, socks_port) = if let Some(socks) = socks_server {
+                parse_proxy_server(socks)?
+            } else {
+                (http_host.clone(), http_port)
+            };
+
+            // KDE 格式: http://host port 或 http://host:port (kioslave 兼容 http://host port)
+            let http_uri = format!("http://{http_host} {http_port}");
+            let socks_uri = format!("socks://{socks_host} {socks_port}");
+
+            kde_write_config(tool, KDE_PROXY_GROUP, "ProxyType", "1")?;
+            kde_write_config(tool, KDE_PROXY_GROUP, "httpProxy", &http_uri)?;
+            kde_write_config(tool, KDE_PROXY_GROUP, "httpsProxy", &http_uri)?;
+            kde_write_config(tool, KDE_PROXY_GROUP, "ftpProxy", &http_uri)?;
+            kde_write_config(tool, KDE_PROXY_GROUP, "socksProxy", &socks_uri)?;
+
+            kde_notify_kio_reload();
+            Ok(())
+        }
+    }
+}
+
+/// 兼容旧接口：将全部协议指向同一个 server。
+#[allow(dead_code)]
+pub(crate) fn set_system_proxy(server: &str) -> Result<()> {
+    set_system_proxy_endpoints(server, None)
+}
+
+/// 按状态文件中的原始快照恢复全部设置。
 pub(crate) fn restore_system_proxy(snapshot: &SystemProxySnapshot) -> Result<()> {
     let linux = snapshot
         .linux
         .as_ref()
-        .ok_or_else(|| anyhow!("系统代理状态文件缺少 Linux GSettings 快照"))?;
+        .ok_or_else(|| anyhow!("系统代理状态文件缺少 Linux 快照"))?;
+
+    if linux.backend == "kde" {
+        let tool = detect_kde_tool().unwrap_or(KdeTool::Kde5);
+        for setting in &linux.settings {
+            if setting.value.is_empty() {
+                let _ = kde_delete_config(tool, &setting.schema, &setting.key);
+            } else {
+                let _ = kde_write_config(tool, &setting.schema, &setting.key, &setting.value);
+            }
+        }
+        kde_notify_kio_reload();
+        return Ok(());
+    }
+
     if !SCHEMA_CANDIDATES.contains(&linux.schema_prefix.as_str()) {
         bail!("系统代理状态文件包含未知的 Linux schema");
     }
@@ -96,7 +216,7 @@ pub(crate) fn restore_system_proxy(snapshot: &SystemProxySnapshot) -> Result<()>
     gsettings_set(&linux.schema_prefix, "mode", mode)
 }
 
-fn detect_schema() -> Result<String> {
+fn detect_desktop_kind() -> Result<DesktopKind> {
     let desktop = [
         env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
         env::var("XDG_SESSION_DESKTOP").unwrap_or_default(),
@@ -104,7 +224,102 @@ fn detect_schema() -> Result<String> {
     ]
     .join(":")
     .to_ascii_lowercase();
-    let candidates = schema_candidates_for_desktop(&desktop)?;
+
+    if desktop.contains("kde") || desktop.contains("plasma") {
+        let tool = detect_kde_tool().ok_or_else(|| {
+            anyhow!("检测到 KDE 桌面，但未找到 kwriteconfig6 或 kwriteconfig5 工具")
+        })?;
+        return Ok(DesktopKind::Kde(tool));
+    }
+
+    let schema = detect_schema(&desktop)?;
+    Ok(DesktopKind::GSettings(schema))
+}
+
+fn detect_kde_tool() -> Option<KdeTool> {
+    if which_bin("kwriteconfig6") && which_bin("kreadconfig6") {
+        Some(KdeTool::Kde6)
+    } else if which_bin("kwriteconfig5") && which_bin("kreadconfig5") {
+        Some(KdeTool::Kde5)
+    } else {
+        None
+    }
+}
+
+fn which_bin(bin: &str) -> bool {
+    Command::new("which")
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn kde_read_config(tool: KdeTool, group: &str, key: &str) -> Result<String> {
+    let output = Command::new(tool.read_cmd())
+        .args(["--file", "kioslaverc", "--group", group, "--key", key])
+        .output()
+        .with_context(|| format!("无法执行 {} 读取 kioslaverc", tool.read_cmd()))?;
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn kde_write_config(tool: KdeTool, group: &str, key: &str, value: &str) -> Result<()> {
+    let output = Command::new(tool.write_cmd())
+        .args([
+            "--file",
+            "kioslaverc",
+            "--group",
+            group,
+            "--key",
+            key,
+            value,
+        ])
+        .output()
+        .with_context(|| format!("无法执行 {} 写入 kioslaverc", tool.write_cmd()))?;
+    if !output.status.success() {
+        bail!(
+            "写入 KDE 代理配置失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn kde_delete_config(tool: KdeTool, group: &str, key: &str) -> Result<()> {
+    let _ = Command::new(tool.write_cmd())
+        .args([
+            "--file",
+            "kioslaverc",
+            "--group",
+            group,
+            "--key",
+            key,
+            "--delete",
+        ])
+        .output();
+    Ok(())
+}
+
+fn kde_notify_kio_reload() {
+    // 优先通过 D-Bus 通知 kded 重载 proxyscout / reconfigure
+    for service in ["org.kde.kded6", "org.kde.kded5"] {
+        let _ = Command::new("qdbus")
+            .args([
+                service,
+                "/modules/proxyscout",
+                "org.kde.KPAC.ProxyScout.reset",
+            ])
+            .output();
+        let _ = Command::new("qdbus")
+            .args([service, "/kded", "reconfigure"])
+            .output();
+    }
+}
+
+fn detect_schema(desktop: &str) -> Result<String> {
+    let candidates = schema_candidates_for_desktop(desktop)?;
     let output = Command::new("gsettings")
         .arg("list-schemas")
         .output()
@@ -129,7 +344,7 @@ fn schema_candidates_for_desktop(desktop: &str) -> Result<[&'static str; 2]> {
     {
         Ok(SCHEMA_CANDIDATES)
     } else {
-        bail!("当前 Linux 桌面暂不支持系统代理；目前支持 GNOME/Cinnamon 兼容会话")
+        bail!("当前 Linux 桌面暂不支持系统代理；目前支持 GNOME/Cinnamon 与 KDE Plasma 会话")
     }
 }
 
@@ -257,6 +472,7 @@ mod tests {
     #[test]
     fn rejects_incomplete_or_duplicate_snapshots_before_restore() {
         let snapshot = LinuxSystemProxySnapshot {
+            backend: "gsettings".into(),
             schema_prefix: "org.gnome.system.proxy".into(),
             settings: PROXY_KEYS
                 .iter()
@@ -288,7 +504,17 @@ mod tests {
             schema_candidates_for_desktop("x-cinnamon").unwrap()[0],
             "org.cinnamon.system.proxy"
         );
-        assert!(schema_candidates_for_desktop("kde").is_err());
+        assert!(schema_candidates_for_desktop("xfce").is_err());
+    }
+
+    #[test]
+    fn kde_tool_detection_and_command_names() {
+        let tool = KdeTool::Kde5;
+        assert_eq!(tool.write_cmd(), "kwriteconfig5");
+        assert_eq!(tool.read_cmd(), "kreadconfig5");
+        let tool6 = KdeTool::Kde6;
+        assert_eq!(tool6.write_cmd(), "kwriteconfig6");
+        assert_eq!(tool6.read_cmd(), "kreadconfig6");
     }
 
     /// 会短暂修改当前桌面会话的系统代理，手动验证时显式运行：

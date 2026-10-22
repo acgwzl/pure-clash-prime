@@ -11,6 +11,7 @@ use serde_yaml::{Mapping, Value};
 use uuid::Uuid;
 
 use super::controller::Mode;
+use crate::config::CustomListener;
 use crate::platform::AppPaths;
 
 /// 客户端本地基线；保存端口、controller 地址与随机 secret 等本机字段。
@@ -30,6 +31,8 @@ pub(crate) struct LocalBaseline {
     /// 强制进程匹配开关；开启时向 runtime 注入 `find-process-mode: always`，
     /// 由 app.json 的开关在启动时对齐到基线。
     pub(crate) find_process_always: bool,
+    /// 用户自定义入站监听列表。
+    pub(crate) listeners: Vec<CustomListener>,
 }
 
 /// 读取或生成客户端本地基线文件。
@@ -49,6 +52,7 @@ pub(crate) fn ensure_baseline(paths: &AppPaths) -> Result<LocalBaseline> {
         secret: Uuid::new_v4().to_string(),
         tun_enable: false,
         find_process_always: false,
+        listeners: Vec::new(),
     };
     crate::platform::file::atomic_write(file, baseline.to_yaml().as_bytes())
         .with_context(|| format!("无法写入本地基线配置：{}", file.display()))?;
@@ -193,6 +197,33 @@ impl LocalBaseline {
             Value::from(self.controller_addr.clone()),
         );
         set("secret", Value::from(self.secret.clone()));
+
+        // 自定义入站监听列表
+        if !self.listeners.is_empty() {
+            let seq: Vec<Value> = self
+                .listeners
+                .iter()
+                .map(|listener| {
+                    let mut item = Mapping::new();
+                    item.insert(Value::from("name"), Value::from(listener.name.clone()));
+                    item.insert(
+                        Value::from("type"),
+                        Value::from(listener.listener_type.clone()),
+                    );
+                    item.insert(Value::from("port"), Value::from(listener.port));
+                    if let Some(rule) = &listener.rule {
+                        item.insert(Value::from("rule"), Value::from(rule.clone()));
+                    }
+                    if let Some(proxy) = &listener.proxy {
+                        item.insert(Value::from("proxy"), Value::from(proxy.clone()));
+                    }
+                    Value::Mapping(item)
+                })
+                .collect();
+            set("listeners", Value::Sequence(seq));
+        } else {
+            mapping.remove(Value::from("listeners"));
+        }
     }
 }
 
@@ -230,6 +261,31 @@ fn parse_baseline(content: &str) -> Result<LocalBaseline> {
         .and_then(Value::as_str)
         .is_some_and(|mode| mode.eq_ignore_ascii_case("always"));
 
+    let listeners = mapping
+        .get(Value::from("listeners"))
+        .and_then(Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|item| {
+                    let map = item.as_mapping()?;
+                    let name = map.get("name")?.as_str()?.to_owned();
+                    let listener_type = map.get("type")?.as_str()?.to_owned();
+                    let port = map.get("port")?.as_u64()? as u16;
+                    let rule = map.get("rule").and_then(Value::as_str).map(str::to_owned);
+                    let proxy = map.get("proxy").and_then(Value::as_str).map(str::to_owned);
+                    Some(CustomListener {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name,
+                        listener_type,
+                        port,
+                        rule,
+                        proxy,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(LocalBaseline {
         mode: Mode::from_str(
             mapping
@@ -242,6 +298,7 @@ fn parse_baseline(content: &str) -> Result<LocalBaseline> {
         secret: secret.to_owned(),
         tun_enable,
         find_process_always,
+        listeners,
     })
 }
 
@@ -371,6 +428,44 @@ fn node_endpoints_from_yaml(runtime_yaml: &str) -> std::collections::HashMap<Str
         .collect()
 }
 
+/// 校验配置中的自定义监听设置：端口范围必须合法，且相互之间及与 controller、mixed-port 不得冲突。
+pub(crate) fn validate_listeners(
+    mixed_port: u16,
+    controller_addr: &str,
+    listeners: &[CustomListener],
+) -> Result<()> {
+    let mut used_ports = std::collections::HashSet::new();
+    used_ports.insert(mixed_port);
+
+    if let Ok(addr) = controller_addr.parse::<std::net::SocketAddr>() {
+        used_ports.insert(addr.port());
+    } else if let Some(port_str) = controller_addr.rsplit(':').next()
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        used_ports.insert(port);
+    }
+
+    for listener in listeners {
+        if listener.port == 0 {
+            bail!("监听端口不能为 0：{}", listener.name);
+        }
+        if !used_ports.insert(listener.port) {
+            bail!("监听端口冲突（端口 {} 已被占用）", listener.port);
+        }
+        let valid_types = ["mixed", "http", "socks"];
+        if !valid_types.contains(&listener.listener_type.as_str()) {
+            bail!("不支持的监听类型：{}", listener.listener_type);
+        }
+        if let Some(rule) = &listener.rule {
+            let valid_rules = ["rule", "global", "direct"];
+            if !valid_rules.contains(&rule.to_ascii_lowercase().as_str()) {
+                bail!("不支持的规则路由模式：{}", rule);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 校验配置文件是否能被内核接受；`config` 为完整 YAML 文本。
 ///
 /// 会生成一个随包内核 `-t` 的短命子进程，可安全运行在后台线程。
@@ -403,6 +498,7 @@ mod tests {
             secret: "test-secret".to_owned(),
             tun_enable: false,
             find_process_always: false,
+            listeners: Vec::new(),
         }
     }
 
@@ -958,5 +1054,106 @@ rules:
                 .is_err()
         );
         assert!(parse_baseline("not-a-mapping").is_err());
+    }
+
+    #[test]
+    fn baseline_with_custom_listeners_serializes_and_roundtrips() {
+        let mut b = baseline();
+        b.listeners = vec![
+            CustomListener {
+                id: "1".to_string(),
+                name: "http-in".to_string(),
+                listener_type: "http".to_string(),
+                port: 7891,
+                rule: Some("direct".to_string()),
+                proxy: None,
+            },
+            CustomListener {
+                id: "2".to_string(),
+                name: "socks-in".to_string(),
+                listener_type: "socks".to_string(),
+                port: 7892,
+                rule: None,
+                proxy: Some("DIRECT".to_string()),
+            },
+        ];
+        let yaml = b.to_yaml();
+        assert!(yaml.contains("name: http-in"));
+        assert!(yaml.contains("port: 7891"));
+        assert!(yaml.contains("rule: direct"));
+        assert!(yaml.contains("name: socks-in"));
+        assert!(yaml.contains("proxy: DIRECT"));
+
+        let restored = parse_baseline(&yaml).expect("自定义监听应能回读");
+        assert_eq!(restored.listeners.len(), 2);
+        assert_eq!(restored.listeners[0].name, "http-in");
+        assert_eq!(restored.listeners[0].port, 7891);
+        assert_eq!(restored.listeners[0].rule.as_deref(), Some("direct"));
+        assert_eq!(restored.listeners[1].name, "socks-in");
+        assert_eq!(restored.listeners[1].port, 7892);
+        assert_eq!(restored.listeners[1].proxy.as_deref(), Some("DIRECT"));
+    }
+
+    #[test]
+    fn validate_listeners_checks_port_conflicts_and_validity() {
+        let listeners = vec![
+            CustomListener {
+                id: "1".to_string(),
+                name: "http".to_string(),
+                listener_type: "http".to_string(),
+                port: 7891,
+                rule: None,
+                proxy: None,
+            },
+            CustomListener {
+                id: "2".to_string(),
+                name: "socks".to_string(),
+                listener_type: "socks".to_string(),
+                port: 7891, // 冲突
+                rule: None,
+                proxy: None,
+            },
+        ];
+        assert!(validate_listeners(7890, "127.0.0.1:9097", &listeners).is_err());
+
+        let conflict_mixed = vec![CustomListener {
+            id: "1".to_string(),
+            name: "http".to_string(),
+            listener_type: "http".to_string(),
+            port: 7890,
+            rule: None,
+            proxy: None,
+        }];
+        assert!(validate_listeners(7890, "127.0.0.1:9097", &conflict_mixed).is_err());
+
+        let invalid_type = vec![CustomListener {
+            id: "1".to_string(),
+            name: "invalid".to_string(),
+            listener_type: "unknown".to_string(),
+            port: 8080,
+            rule: None,
+            proxy: None,
+        }];
+        assert!(validate_listeners(7890, "127.0.0.1:9097", &invalid_type).is_err());
+
+        let valid = vec![
+            CustomListener {
+                id: "1".to_string(),
+                name: "http".to_string(),
+                listener_type: "http".to_string(),
+                port: 7891,
+                rule: Some("rule".to_string()),
+                proxy: None,
+            },
+            CustomListener {
+                id: "2".to_string(),
+                name: "socks".to_string(),
+                listener_type: "socks".to_string(),
+                port: 7892,
+                rule: Some("direct".to_string()),
+                proxy: None,
+            },
+        ];
+        assert!(validate_listeners(7890, "127.0.0.1:9097", &valid).is_ok());
     }
 }

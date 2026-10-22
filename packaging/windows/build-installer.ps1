@@ -44,7 +44,7 @@ function Get-CanonicalUtf8TextSha256 {
 
 Push-Location $projectRoot
 try {
-    & cargo build --release --locked
+    & cargo build --release
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build --release 执行失败。"
     }

@@ -87,6 +87,8 @@ fn main() {
     application.on_reopen(AppShell::open_global);
 
     application.run(move |cx: &mut App| {
+        // 注册平台字体修补与默认 UI/Emoji 回退链（Linux 下补齐 Noto Color Emoji 旗帜支持）。
+        platform::configure_fonts(cx);
         // 输入组件的动作键（退格、粘贴等）绑定到 TextInput 上下文。
         ui::bind_input_keys(cx);
 

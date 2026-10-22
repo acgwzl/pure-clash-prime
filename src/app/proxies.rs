@@ -18,20 +18,22 @@ struct NodeNameTooltip {
 
 impl Render for NodeNameTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .max_w(px(480.0))
-            .px_3()
-            .py_2()
-            .rounded_sm()
-            .bg(self.palette.surface)
-            .border_1()
-            .border_color(self.palette.border)
-            .shadow_md()
-            .text_sm()
-            .text_color(self.palette.text)
-            // 提示允许换行且不截断，让超长名称也能完整阅读。
-            .whitespace_normal()
-            .child(self.name.clone())
+        crate::platform::apply_ui_font(
+            div()
+                .max_w(px(480.0))
+                .px_3()
+                .py_2()
+                .rounded_sm()
+                .bg(self.palette.surface)
+                .border_1()
+                .border_color(self.palette.border)
+                .shadow_md()
+                .text_sm()
+                .text_color(self.palette.text)
+                // 提示允许换行且不截断，让超长名称也能完整阅读。
+                .whitespace_normal()
+                .child(self.name.clone()),
+        )
     }
 }
 

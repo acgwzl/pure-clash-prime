@@ -28,7 +28,8 @@ Currently available for Windows x64 and Linux x64 (Wayland / X11); macOS keeps d
 - **Offline Geo databases** — `GeoSite.dat`, `GeoIP.dat`, and `Country.mmdb` ship with every package, are restored locally without network access, and can be updated explicitly from Settings
 - **Proxy groups and latency tests** — subscription nodes rendered per group, rule/global/direct mode switched live through the controller; per-node and per-group delay tests with threshold-based coloring
 - **Connections and live traffic** — a per-second controller snapshot poll showing process, target, chain, rule and per-connection up/down bytes; close a single connection or all of them; the overview shows live speed and active connections
-- **System proxy** — Windows writes the current user's Internet Settings and broadcasts via WinINet; Linux supports GNOME/Cinnamon sessions through `gsettings`. The user's original settings are saved atomically before enabling and restored on disable, core stop or crash recovery
+- **Custom inbound listeners** — configure additional `http`, `socks`, and `mixed` listeners alongside the default mixed port, each with an independent routing mode (`follow`, `rule`, `global`, `direct`), validated via `-t` and automatically reloaded on save
+- **System proxy** — Windows writes the current user's Internet Settings and broadcasts via WinINet; Linux supports GNOME/Cinnamon sessions through `gsettings` and KDE Plasma (5/6) through `kwriteconfig`/`kioslaverc` with independent HTTP and SOCKS endpoints. The user's original settings are saved atomically before enabling and restored on disable, core stop or crash recovery
 - **TUN mode** — Windows elevates only the kernel via UAC and uses the bundled wintun; Linux follows the Clash Verge Rev service model: a one-time `pkexec` installs a root systemd service, afterwards start/stop goes through a UID-restricted IPC and never asks for the password again; TUN automatically reverts when it does not take effect
 - **Desktop integration** — tray icon with live multi-language status, single-instance lock, close-to-tray, dark/light themes and a Chinese/English interface
 - **Minimal memory footprint** — the desktop client itself typically stays under 30 MB of memory (excluding the Mihomo kernel)
@@ -44,7 +45,7 @@ Five primary pages plus an About page: Overview (stat cards, current outbound, r
 | Kernel start/stop and guarding | ✅ | ✅ | Reserved |
 | Profiles and proxy control | ✅ | ✅ | Reserved |
 | Connections and live traffic | ✅ | ✅ | Reserved |
-| System proxy | ✅ | ✅ GNOME/Cinnamon | Not implemented |
+| System proxy | ✅ | ✅ GNOME/Cinnamon/KDE | Not implemented |
 | TUN mode | ✅ UAC + wintun | ✅ polkit + root service | Not implemented |
 | Tray | ✅ | ✅ SNI (AppIndicator extension needed on GNOME) | Not implemented |
 | Single instance | ✅ | ✅ | Not implemented |
@@ -125,7 +126,7 @@ See the [technical design document](docs/pure-clash-architecture.md) for the ful
 ## Roadmap
 
 - Rules page and log/memory monitoring (controller `/rules`, `/logs`, `/memory`)
-- Linux credential storage and system proxy for other desktops such as KDE
+- Linux credential storage and system proxy for additional desktops beyond GNOME/Cinnamon/KDE
 - Full macOS support (kernel guarding, window behavior, TUN boundary)
 - Code signing and an update channel
 

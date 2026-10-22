@@ -65,9 +65,17 @@ pub(crate) fn set_autostart(_enabled: bool) -> anyhow::Result<()> {
 pub(crate) use tray::{SystemTray, TrayAction};
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::show_main_window;
+pub(crate) use linux::{apply_ui_font, configure_fonts, show_main_window};
 #[cfg(target_os = "windows")]
 pub(crate) use windows::show_main_window;
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn configure_fonts(_cx: &mut gpui::App) {}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn apply_ui_font<T: gpui::Styled>(element: T) -> T {
+    element
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{SingleInstance, SingleInstanceState};
@@ -78,12 +86,19 @@ pub(crate) use windows::{SingleInstance, SingleInstanceState};
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     ElevatedProcess, capture_system_proxy, launch_elevated, restore_system_proxy,
-    run_elevated_helper_if_requested, set_system_proxy,
+    run_elevated_helper_if_requested, set_system_proxy_endpoints,
 };
 #[cfg(target_os = "windows")]
 pub(crate) use windows::{
     ElevatedProcess, capture_system_proxy, launch_elevated, restore_system_proxy, set_system_proxy,
 };
+#[cfg(target_os = "windows")]
+pub(crate) fn set_system_proxy_endpoints(
+    http_server: &str,
+    _socks_server: Option<&str>,
+) -> anyhow::Result<()> {
+    windows::set_system_proxy(http_server)
+}
 
 /// Linux 对齐 Clash Verge Rev 使用 gVisor；Windows 保持已验证的 mixed 栈，
 /// 避免 Linux 修复改变现有 Wintun 行为。
@@ -159,7 +174,9 @@ mod elevation_stub {
 #[cfg(target_os = "macos")]
 pub(crate) use elevation_stub::{ElevatedProcess, launch_elevated};
 #[cfg(target_os = "macos")]
-pub(crate) use system_proxy_stub::{capture_system_proxy, restore_system_proxy, set_system_proxy};
+pub(crate) use system_proxy_stub::{
+    capture_system_proxy, restore_system_proxy, set_system_proxy, set_system_proxy_endpoints,
+};
 
 /// macOS 系统代理入口：正式实现接入前统一报"暂不支持"。
 #[cfg(target_os = "macos")]
@@ -171,6 +188,13 @@ mod system_proxy_stub {
     }
 
     pub(crate) fn set_system_proxy(_server: &str) -> anyhow::Result<()> {
+        anyhow::bail!("当前平台暂不支持系统代理")
+    }
+
+    pub(crate) fn set_system_proxy_endpoints(
+        _http: &str,
+        _socks: Option<&str>,
+    ) -> anyhow::Result<()> {
         anyhow::bail!("当前平台暂不支持系统代理")
     }
 
@@ -187,23 +211,32 @@ pub(crate) struct SystemProxySnapshot {
     pub(crate) prev_enabled: bool,
     /// 托管前的代理服务器地址。
     pub(crate) prev_server: String,
-    /// Linux 桌面会话中被修改的 GSettings 原始值；Windows 旧状态文件缺少
+    /// Linux 桌面会话中被修改的 GSettings 或 KDE 原始值；Windows 旧状态文件缺少
     /// 此字段时按 `None` 兼容读取。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) linux: Option<LinuxSystemProxySnapshot>,
 }
 
-/// Linux GNOME/Cinnamon 系统代理的完整快照。
+/// Linux 桌面系统代理（GNOME/Cinnamon 或 KDE Plasma）的完整快照。
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LinuxSystemProxySnapshot {
-    /// `org.gnome.system.proxy` 或兼容的 Cinnamon schema 前缀。
+    /// 桌面后端类型：`"gsettings"`（GNOME/Cinnamon）或 `"kde"`（Plasma）。
+    #[serde(default = "default_linux_backend")]
+    pub(crate) backend: String,
+    /// `org.gnome.system.proxy` 或兼容的 Cinnamon schema 前缀（仅 GSettings 有效）。
+    #[serde(default)]
     pub(crate) schema_prefix: String,
-    /// 所有会被 Pure Clash 修改的键及其原始 GVariant 文本。
+    /// 所有会被 Pure Clash 修改的键及其原始文本。
     pub(crate) settings: Vec<LinuxProxySetting>,
+}
+
+fn default_linux_backend() -> String {
+    "gsettings".to_string()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LinuxProxySetting {
+    /// 在 GSettings 下为 schema 名称；在 KDE 下为配置组名称（如 `"Proxy Settings"`）。
     pub(crate) schema: String,
     pub(crate) key: String,
     pub(crate) value: String,

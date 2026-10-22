@@ -4,8 +4,10 @@ use gpui::{Animation, AnimationExt, AnyElement, Context, SharedString, Styled, d
 
 use super::overview::integration_error_banner;
 use super::*;
-use crate::assets::{ICON_FOLDER, ICON_REFRESH_CW, ICON_SETTINGS, ICON_SHIELD_CHECK};
-use crate::config::Language;
+use crate::assets::{
+    ICON_FOLDER, ICON_GIT_BRANCH, ICON_PLUS, ICON_REFRESH_CW, ICON_SETTINGS, ICON_SHIELD_CHECK,
+};
+use crate::config::{CustomListener, Language};
 use crate::theme::{FontWeightExt, Palette};
 
 pub(super) fn render_settings(
@@ -88,6 +90,7 @@ pub(super) fn render_settings(
                 ))
                 .child(language_setting_row(app.config.language, palette, cx)),
         )
+        .child(render_listeners_section(app, palette, cx))
         .child(
             div()
                 .mt_4()
@@ -435,5 +438,410 @@ fn path_row(
                 .whitespace_nowrap()
                 .child(path),
         )
+        .into_any_element()
+}
+
+fn render_listeners_section(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let mixed_port = app.baseline.as_ref().map_or(7890, |b| b.mixed_port);
+    let default_desc = format!("127.0.0.1:{mixed_port} (mixed)");
+
+    let mut container = div()
+        .mt_4()
+        .p_4()
+        .rounded_md()
+        .bg(palette.surface)
+        .border_1()
+        .border_color(palette.border)
+        .child(section_heading(
+            tr("settings.listeners"),
+            tr("settings.listeners_detail"),
+            ICON_GIT_BRANCH,
+            palette,
+        ))
+        .child(
+            div()
+                .min_h(px(42.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(palette.border)
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(palette.muted)
+                        .child("mixed-port (Default)"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(palette.text)
+                        .child(SharedString::from(default_desc)),
+                ),
+        );
+
+    for listener in &app.config.listeners {
+        container = container.child(render_listener_row(listener, palette, cx));
+    }
+
+    container = container.child(render_listener_add_form(app, palette, cx));
+    container.into_any_element()
+}
+
+fn render_listener_row(
+    listener: &CustomListener,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let id_for_del = listener.id.clone();
+    let title = format!(
+        "{} ({}:{})",
+        listener.name, listener.listener_type, listener.port
+    );
+    let current_rule = listener.rule.clone();
+
+    div()
+        .min_h(px(48.0))
+        .py_2()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .border_b_1()
+        .border_color(palette.border)
+        .child(
+            div()
+                .flex_1()
+                .text_sm()
+                .font_medium()
+                .text_color(palette.text)
+                .child(SharedString::from(title)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .p_0p5()
+                        .rounded_sm()
+                        .bg(palette.surface_alt)
+                        .border_1()
+                        .border_color(palette.border)
+                        .child(listener_rule_chip(
+                            &listener.id,
+                            None,
+                            tr("settings.listener_mode_default"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        ))
+                        .child(listener_rule_chip(
+                            &listener.id,
+                            Some("rule"),
+                            tr("settings.listener_mode_rule"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        ))
+                        .child(listener_rule_chip(
+                            &listener.id,
+                            Some("global"),
+                            tr("settings.listener_mode_global"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        ))
+                        .child(listener_rule_chip(
+                            &listener.id,
+                            Some("direct"),
+                            tr("settings.listener_mode_direct"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("del-listener-{}", listener.id)))
+                        .h(px(26.0))
+                        .px_2p5()
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .bg(palette.surface_alt)
+                        .border_1()
+                        .border_color(palette.border)
+                        .text_xs()
+                        .text_color(palette.muted)
+                        .child(tr("settings.delete"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_custom_listener(id_for_del.clone(), cx);
+                        })),
+                ),
+        )
+        .into_any_element()
+}
+
+fn listener_rule_chip(
+    listener_id: &str,
+    rule_val: Option<&'static str>,
+    label: SharedString,
+    current: Option<&str>,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let active = match (rule_val, current) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    let id_owned = listener_id.to_owned();
+    let target_rule = rule_val.map(|s| s.to_owned());
+    let chip_id = SharedString::from(format!(
+        "listener-rule-{}-{}",
+        listener_id,
+        rule_val.unwrap_or("default")
+    ));
+
+    div()
+        .id(chip_id)
+        .h(px(24.0))
+        .px_2()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_xs()
+        .font_medium()
+        .bg(if active {
+            palette.surface
+        } else {
+            palette.surface_alt
+        })
+        .text_color(if active {
+            palette.accent
+        } else {
+            palette.muted
+        })
+        .child(label)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.update_custom_listener_rule(id_owned.clone(), target_rule.clone(), cx);
+        }))
+        .into_any_element()
+}
+
+fn render_listener_add_form(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let current_type = app.listener_form_type.clone();
+    let current_rule = app.listener_form_rule.clone();
+
+    div()
+        .mt_3()
+        .pt_2()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(140.0))
+                        .p_1p5()
+                        .rounded_sm()
+                        .bg(palette.surface_alt)
+                        .border_1()
+                        .border_color(palette.border)
+                        .text_xs()
+                        .text_color(palette.text)
+                        .line_height(px(18.0))
+                        .child(app.listener_form_name.clone()),
+                )
+                .child(
+                    div()
+                        .w(px(90.0))
+                        .p_1p5()
+                        .rounded_sm()
+                        .bg(palette.surface_alt)
+                        .border_1()
+                        .border_color(palette.border)
+                        .text_xs()
+                        .text_color(palette.text)
+                        .line_height(px(18.0))
+                        .child(app.listener_form_port.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .p_0p5()
+                        .rounded_sm()
+                        .bg(palette.surface_alt)
+                        .border_1()
+                        .border_color(palette.border)
+                        .child(form_type_option("http", &current_type, palette, cx))
+                        .child(form_type_option("socks", &current_type, palette, cx))
+                        .child(form_type_option("mixed", &current_type, palette, cx)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .p_0p5()
+                        .rounded_sm()
+                        .bg(palette.surface_alt)
+                        .border_1()
+                        .border_color(palette.border)
+                        .child(form_rule_option(
+                            None,
+                            tr("settings.listener_mode_default"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        ))
+                        .child(form_rule_option(
+                            Some("rule"),
+                            tr("settings.listener_mode_rule"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        ))
+                        .child(form_rule_option(
+                            Some("global"),
+                            tr("settings.listener_mode_global"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        ))
+                        .child(form_rule_option(
+                            Some("direct"),
+                            tr("settings.listener_mode_direct"),
+                            current_rule.as_deref(),
+                            palette,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .id("add-custom-listener-btn")
+                        .h(px(28.0))
+                        .px_3()
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .bg(palette.accent)
+                        .text_xs()
+                        .font_medium()
+                        .text_color(palette.surface)
+                        .child(icon(ICON_PLUS, palette.surface, 13.0))
+                        .child(tr("settings.save_and_reload"))
+                        .on_click(cx.listener(|this, _, _, cx| this.add_custom_listener(cx))),
+                ),
+        )
+        .into_any_element()
+}
+
+fn form_type_option(
+    type_name: &'static str,
+    current: &str,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let active = current == type_name;
+    div()
+        .id(SharedString::from(format!(
+            "form-listener-type-{type_name}"
+        )))
+        .h(px(24.0))
+        .px_2p5()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_xs()
+        .font_medium()
+        .bg(if active {
+            palette.surface
+        } else {
+            palette.surface_alt
+        })
+        .text_color(if active {
+            palette.accent
+        } else {
+            palette.muted
+        })
+        .child(type_name)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_listener_form_type(type_name.to_owned(), cx);
+        }))
+        .into_any_element()
+}
+
+fn form_rule_option(
+    rule_val: Option<&'static str>,
+    label: SharedString,
+    current: Option<&str>,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let active = match (rule_val, current) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    let target = rule_val.map(|s| s.to_owned());
+    let id = SharedString::from(format!(
+        "form-listener-rule-{}",
+        rule_val.unwrap_or("default")
+    ));
+    div()
+        .id(id)
+        .h(px(24.0))
+        .px_2()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_xs()
+        .font_medium()
+        .bg(if active {
+            palette.surface
+        } else {
+            palette.surface_alt
+        })
+        .text_color(if active {
+            palette.accent
+        } else {
+            palette.muted
+        })
+        .child(label)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_listener_form_rule(target.clone(), cx);
+        }))
         .into_any_element()
 }

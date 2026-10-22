@@ -562,6 +562,7 @@ mod tests {
             secret: "activate-secret".to_owned(),
             tun_enable: false,
             find_process_always: false,
+            listeners: Vec::new(),
         };
         let profile_yaml = "\
 proxies:
