@@ -4,7 +4,10 @@ use gpui::{AnyElement, Context, SharedString, Styled, div, px, relative};
 use rust_i18n::t;
 
 use super::*;
-use crate::assets::{ICON_CIRCLE_CHECK, ICON_FILE_CODE, ICON_FOLDER, ICON_SEND, ICON_SHIELD_CHECK};
+use crate::assets::{
+    ICON_CIRCLE_CHECK, ICON_FILE_CODE, ICON_FOLDER, ICON_REFRESH_CW, ICON_SEND, ICON_SHIELD_CHECK,
+    ICON_WINDOW_CLOSE,
+};
 use crate::config::{ProfileMeta, SubscriptionUsage};
 use crate::theme::{FontWeightExt, Palette, text_size};
 use crate::ui::kit;
@@ -552,6 +555,7 @@ fn profile_card(
         tr("profiles.source_local")
     };
     let updated = format_profile_time(meta.updated_at);
+    let menu_id = meta.id.clone();
     kit::card(palette)
         .id(SharedString::from(format!("profile-card-{}", meta.id)))
         // 与内置卡片一致：自适应宽度并均分行内空间。
@@ -589,6 +593,9 @@ fn profile_card(
         )))
         .child(usage_bar(meta.usage.as_ref(), palette))
         .on_click(cx.listener(move |this, _, _, cx| this.activate_profile_clicked(index, cx)))
+        .on_aux_click(cx.listener(move |this, _, _, cx| {
+            this.open_profile_menu(menu_id.clone(), cx)
+        }))
         .into_any_element()
 }
 
@@ -1040,5 +1047,135 @@ fn profile_editor(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_profile_edit(cx))),
                 ),
         )
+        .into_any_element()
+}
+
+/// 订阅卡片右键菜单：编辑 / 立即更新 / 设为当前 / 删除。
+///
+/// 卡片视图把整卡点击留给「激活」，其余操作集中到右键菜单，
+/// 避免在卡片里塞一排图标按钮。
+pub(super) fn render_profile_menu(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let Some(id) = app.profile_menu_for.clone() else {
+        return div().into_any_element();
+    };
+    let Some(index) = app.config.profiles.iter().position(|meta| meta.id == id) else {
+        return div().into_any_element();
+    };
+    let meta = &app.config.profiles[index];
+    let name = SharedString::from(meta.name.clone());
+    let is_active = app.active_profile.as_deref() == Some(meta.id.as_str());
+    let can_update = meta.url.is_some();
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+    rows.push(menu_item(
+        "profile-menu-edit",
+        tr("profiles.menu_edit"),
+        ICON_FILE_CODE,
+        palette,
+        cx.listener(move |this, _, _, cx| {
+            this.close_profile_menu(cx);
+            this.edit_profile(index, cx);
+        }),
+    ));
+    if can_update {
+        rows.push(menu_item(
+            "profile-menu-update",
+            tr("profiles.menu_update"),
+            ICON_REFRESH_CW,
+            palette,
+            cx.listener(move |this, _, _, cx| {
+                this.close_profile_menu(cx);
+                this.update_profile(index, cx);
+            }),
+        ));
+    }
+    if !is_active {
+        rows.push(menu_item(
+            "profile-menu-activate",
+            tr("profiles.menu_activate"),
+            ICON_CIRCLE_CHECK,
+            palette,
+            cx.listener(move |this, _, _, cx| {
+                this.close_profile_menu(cx);
+                this.activate_profile_clicked(index, cx);
+            }),
+        ));
+    }
+    rows.push(menu_item(
+        "profile-menu-delete",
+        tr("profiles.menu_delete"),
+        ICON_WINDOW_CLOSE,
+        palette,
+        cx.listener(move |this, _, _, cx| {
+            this.close_profile_menu(cx);
+            this.delete_profile(index, cx);
+        }),
+    ));
+
+    div()
+        .id("profile-menu-scrim")
+        .absolute()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x00000099))
+        // 点遮罩关闭；面板自身吞掉点击，避免误关。
+        .on_click(cx.listener(|this, _, _, cx| this.close_profile_menu(cx)))
+        .child(
+            div()
+                .id("profile-menu-panel")
+                .w(px(280.0))
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .bg(palette.surface_high)
+                .border_1()
+                .border_color(palette.border)
+                .shadow_lg()
+                .on_click(|_, _, _| {})
+                .child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(palette.border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_medium()
+                                .text_color(palette.text)
+                                .truncate()
+                                .child(name),
+                        ),
+                )
+                .children(rows),
+        )
+        .into_any_element()
+}
+
+fn menu_item(
+    id: &'static str,
+    label: SharedString,
+    icon_path: &'static str,
+    palette: Palette,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .h(px(38.0))
+        .px_4()
+        .flex()
+        .items_center()
+        .gap_3()
+        .cursor_pointer()
+        .hover(|style| style.bg(palette.inset))
+        .child(icon(icon_path, palette.muted, 14.0))
+        .child(div().text_sm().text_color(palette.text).child(label))
+        .on_click(handler)
         .into_any_element()
 }

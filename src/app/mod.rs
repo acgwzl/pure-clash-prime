@@ -82,6 +82,7 @@ mod view_state;
 pub(crate) use shell::AppShell;
 
 use extra_rules::render_picker_overlay;
+use profiles::render_profile_menu;
 #[cfg(target_os = "linux")]
 use frame::linux_client_side_decorations;
 use frame::render_titlebar;
@@ -380,6 +381,8 @@ pub(crate) struct PureClash {
     auto_update_in_flight: Option<String>,
     /// 行内编辑链接与更新间隔的配置下标；None 表示未在编辑。
     editing_profile_index: Option<usize>,
+    /// 右键打开的订阅操作菜单所指向的配置 id；None 表示菜单关闭。
+    profile_menu_for: Option<String>,
     /// 行内编辑自动更新间隔的输入框。
     profile_form_interval: Entity<TextInput>,
     /// 登录自启、系统代理与 TUN 的操作失败提示，展示在设置页与概览页。
@@ -601,7 +604,7 @@ impl PureClash {
             extra_rule_target_picker: false,
             extra_rule_options_shown: extra_rules::OPTION_PAGE_SIZE,
             extra_rule_error: None,
-            profiles_view: ProfilesView::List,
+            profiles_view: ProfilesView::Grid,
             usage_refresh_in_flight: false,
             extra_rule_notice: None,
             _extra_rule_input_observer,
@@ -619,6 +622,7 @@ impl PureClash {
             profile_error: runtime_error,
             auto_update_in_flight: None,
             editing_profile_index: None,
+            profile_menu_for: None,
             profile_form_interval,
             integration_error: None,
             geodata_info,
@@ -683,7 +687,11 @@ impl Render for PureClash {
             .when(
                 self.extra_rule_type_picker || self.extra_rule_target_picker,
                 |root| root.child(render_picker_overlay(self, palette, cx)),
-            );
+            )
+            // 订阅操作菜单同样挂在页面容器之外：遮罩不随页面滚动。
+            .when(self.profile_menu_for.is_some(), |root| {
+                root.child(render_profile_menu(self, palette, cx))
+            });
 
         #[cfg(target_os = "linux")]
         return linux_client_side_decorations(content, palette, window);

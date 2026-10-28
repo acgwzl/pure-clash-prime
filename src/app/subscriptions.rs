@@ -587,6 +587,8 @@ impl PureClash {
         let Some(url) = meta.url.clone() else {
             return;
         };
+        // 编辑器渲染在列表行下方，卡片视图里没有落点，先切回列表。
+        self.profiles_view = ProfilesView::List;
         self.editing_profile_index = Some(index);
         let initial = if meta.update_interval_minutes == 0 {
             String::new()
@@ -891,5 +893,19 @@ impl PureClash {
                 }
             }
         }
+    }
+}
+
+impl PureClash {
+    /// 打开某个订阅的操作菜单（右键卡片触发）。
+    pub(super) fn open_profile_menu(&mut self, id: String, cx: &mut Context<Self>) {
+        self.profile_menu_for = Some(id);
+        cx.notify();
+    }
+
+    /// 关闭订阅操作菜单。
+    pub(super) fn close_profile_menu(&mut self, cx: &mut Context<Self>) {
+        self.profile_menu_for = None;
+        cx.notify();
     }
 }
