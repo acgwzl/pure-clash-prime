@@ -173,6 +173,10 @@ impl PureClash {
                 );
                 self.mihomo_process = Some(process);
                 self.mihomo_error = None;
+                // 运行时长与峰值都按「本次内核会话」计；重启即重新计时。
+                self.core_started_at = Some(std::time::Instant::now());
+                self.peak_down_speed = 0;
+                self.peak_up_speed = 0;
                 self.spawn_readiness_probe(generation, cx);
             }
             Err(error) => {

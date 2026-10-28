@@ -418,6 +418,18 @@ pub(crate) struct PureClash {
     update_available: bool,
     /// 关于页检查更新的结果文案；None 表示尚未检查。
     update_status: Option<SharedString>,
+    /// 内核启动时刻；概览页据此计算运行时长。
+    core_started_at: Option<std::time::Instant>,
+    /// 本次会话的下载峰值速率（字节/秒）；内核重启时归零。
+    peak_down_speed: u64,
+    /// 本次会话的上传峰值速率（字节/秒）；内核重启时归零。
+    peak_up_speed: u64,
+    /// 公网出口的运营商/组织名；来自出口 IP 归属查询，未检测时为 None。
+    public_isp: Option<String>,
+    /// 应用进程常驻内存（字节）；采样失败为 None。
+    app_memory: Option<u64>,
+    /// 内核进程常驻内存（字节）；内核未运行或采样失败为 None。
+    core_memory: Option<u64>,
     /// 关于页检查更新的结果是否为新版本（用于强调提示）。
     update_status_is_release: bool,
     /// 启动后是否已自动检查过一次更新。
@@ -626,6 +638,12 @@ impl PureClash {
             update_checking: false,
             update_available: false,
             update_status: None,
+            core_started_at: None,
+            peak_down_speed: 0,
+            peak_up_speed: 0,
+            public_isp: None,
+            app_memory: None,
+            core_memory: None,
             update_status_is_release: false,
             startup_update_checked: false,
             proxy_group_order: None,

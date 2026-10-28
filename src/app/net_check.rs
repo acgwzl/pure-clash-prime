@@ -23,6 +23,11 @@ struct GeoIp {
     ip: String,
     #[serde(default)]
     country_code: String,
+    /// 运营商/组织名；同一接口在不同 IP 段上只给其中一个字段，两个都收。
+    #[serde(default)]
+    organization: String,
+    #[serde(default)]
+    isp: String,
 }
 
 /// 取本机默认路由出口地址:UDP 连接不实际发包,只让内核选出一条路由,
@@ -51,7 +56,7 @@ pub(super) fn flag_of(country_code: &str) -> String {
 ///
 /// 走内核而不是直连:直连拿到的是本机真实地址,与「当前出口」的语义不符;
 /// 内核未运行时宁可报错,也不静默给出误导性的结果。
-fn lookup_public(mixed_port: u16) -> anyhow::Result<(String, String)> {
+fn lookup_public(mixed_port: u16) -> anyhow::Result<(String, String, String)> {
     let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{mixed_port}"))
         .map_err(|_| anyhow::anyhow!(t!("overview.network_proxy_invalid").into_owned()))?;
     let agent = ureq::AgentBuilder::new()
@@ -64,7 +69,12 @@ fn lookup_public(mixed_port: u16) -> anyhow::Result<(String, String)> {
         .map_err(|_| anyhow::anyhow!(t!("overview.network_unreachable").into_owned()))?
         .into_json()
         .context("出口 IP 查询响应格式无效")?;
-    Ok((geo.ip, geo.country_code))
+    let isp = if geo.organization.is_empty() {
+        geo.isp
+    } else {
+        geo.organization
+    };
+    Ok((geo.ip, geo.country_code, isp))
 }
 
 impl PureClash {
@@ -79,6 +89,7 @@ impl PureClash {
         self.net_check_local = local_ip();
         self.net_check_public = None;
         self.net_check_flag = String::new();
+        self.public_isp = None;
         self.net_check_error = None;
         let Some(mixed_port) = self
             .baseline
@@ -105,9 +116,10 @@ impl PureClash {
                 }
                 this.net_check_loading = false;
                 match result {
-                    Ok((ip, country_code)) => {
+                    Ok((ip, country_code, isp)) => {
                         this.net_check_flag = flag_of(&country_code);
                         this.net_check_public = Some(ip);
+                        this.public_isp = if isp.is_empty() { None } else { Some(isp) };
                     }
                     Err(error) => {
                         this.net_check_error = Some(concise_error(&format!("{error:#}"), 120));

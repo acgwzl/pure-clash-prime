@@ -111,6 +111,15 @@ impl PureClash {
         self.traffic_up_speed = snapshot.upload_total.saturating_sub(self.upload_total);
         self.download_total = snapshot.download_total;
         self.upload_total = snapshot.upload_total;
+        self.peak_down_speed = self.peak_down_speed.max(self.traffic_down_speed);
+        self.peak_up_speed = self.peak_up_speed.max(self.traffic_up_speed);
+        // 内存随同一次轮询采样：OpenProcess 开销远低于一帧渲染，1 秒一次足够。
+        self.app_memory = crate::platform::process_rss(std::process::id());
+        self.core_memory = self
+            .mihomo_process
+            .as_ref()
+            .and_then(|process| process.pid())
+            .and_then(crate::platform::process_rss);
         self.connections = snapshot.connections;
     }
 
@@ -118,6 +127,8 @@ impl PureClash {
     pub(super) fn clear_live_traffic(&mut self) {
         self.traffic_down_speed = 0;
         self.traffic_up_speed = 0;
+        self.core_started_at = None;
+        self.core_memory = None;
         self.connections.clear();
     }
 

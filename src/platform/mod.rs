@@ -498,3 +498,40 @@ mod tests {
         assert!(options.window_decorations.is_none());
     }
 }
+
+/// 读取进程常驻内存（字节）。
+///
+/// 概览页只做展示，采样失败（进程已退出、权限不足）返回 None 即可，
+/// 不向调用方传播错误。
+#[cfg(target_os = "windows")]
+pub(crate) fn process_rss(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: 句柄在使用后立即关闭；计数器结构体由系统填充，cb 先按类型大小赋值。
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = K32GetProcessMemoryInfo(handle, &mut counters, counters.cb);
+        CloseHandle(handle);
+        if ok == 0 {
+            None
+        } else {
+            Some(counters.WorkingSetSize as u64)
+        }
+    }
+}
+
+/// 非 Windows 平台暂不采样内存，概览页显示为未知。
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn process_rss(_pid: u32) -> Option<u64> {
+    None
+}
