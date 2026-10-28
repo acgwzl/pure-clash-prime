@@ -175,7 +175,8 @@ fn geodata_update_row(
     let revision = short_revision(&app.geodata_info.revision);
     let updated = super::profiles::format_profile_time(app.geodata_info.updated_at);
     div()
-        .min_h(px(48.0))
+        .min_h(px(56.0))
+        .px(px(20.0))
         .flex()
         .items_center()
         .gap_3()
@@ -273,7 +274,8 @@ fn setting_row(
     div()
         // 这些行是同一张卡片的直接子元素且容器无间距，底边线是行与行之间
         // 唯一的分隔，必须保留；只把行高从 62 收紧到 54。
-        .min_h(px(54.0))
+        .min_h(px(62.0))
+        .px(px(20.0))
         .flex()
         .items_center()
         .gap_3()
@@ -426,26 +428,32 @@ fn path_row(
     let label = label.into();
     let path = path.into();
     let row = div()
-        .min_h(px(42.0))
+        .min_h(px(46.0))
+        // 卡片本身没有内边距，行必须自带，否则文字贴着卡片边框。
+        .px(px(20.0))
         .flex()
         .items_center()
-        .justify_between()
+        .gap(px(16.0))
         .child(
+            // 标签固定不压缩，路径用剩余空间并省略，避免长路径把卡片撑破。
             div()
+                .flex_none()
                 .text_size(px(text_size::ROW))
                 .text_color(palette.text)
                 .child(label),
         )
         .child(
-            div()
-                .max_w(px(380.0))
-                .font_family("Bahnschrift")
-                .text_size(px(text_size::META))
-                .tabnum()
-                .text_color(palette.muted)
-                .text_ellipsis()
-                .whitespace_nowrap()
-                .child(path),
+            div().flex_1().min_w_0().flex().justify_end().child(
+                div()
+                    .min_w_0()
+                    .font_family("Bahnschrift")
+                    .text_size(px(text_size::META))
+                    .tabnum()
+                    .text_color(palette.muted)
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(path),
+            ),
         );
     // 卡内最后一行不画线：底缘圆角旁边悬空一条线是评审点过名的瑕疵。
     if divider {

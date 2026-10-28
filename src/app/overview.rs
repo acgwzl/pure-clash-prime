@@ -133,7 +133,9 @@ fn hero(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyEl
         .child(
             div()
                 .mt_3()
-                .w_full()
+                // 固定宽度并随 items_end 右对齐：与上面的速率数字同一条右边缘，
+                // 用 w_full 会让它在 items_end 下向左溢出，压到左侧出站信息区。
+                .w(px(260.0))
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -153,7 +155,7 @@ fn hero(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyEl
 
     kit::hero_card(palette)
         .id("overview-hero")
-        .h(px(176.0))
+        .h(px(196.0))
         .flex_none()
         .min_w_0()
         .px(px(24.0))
@@ -288,7 +290,14 @@ fn speed_bar(palette: Palette, ratio: f32, color: Rgba, label: String) -> AnyEle
         .flex()
         .items_center()
         .gap_2()
-        .child(kit::progress(palette, ratio, color).flex_1())
+        // progress 自身是 w_full；外层用 flex_1 的容器约束宽度，
+        // 直接叠加 flex_1 会让两者的宽度语义互相覆盖，进度条被挤成半截。
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(kit::progress(palette, ratio, color)),
+        )
         .child(
             div()
                 .font_family("Bahnschrift")
