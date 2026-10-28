@@ -1,18 +1,21 @@
-//! 页面容器与页头：页面路由、标题副标题、系统代理 / TUN 开关芯片、内核按钮。
+//! 页面容器：路由到各页并承载滚动区。
+//!
+//! 页名与副标题由顶栏承载（见 frame.rs），系统代理 / TUN 快捷开关与
+//! 内核启停也已上移顶栏——这里不再渲染页头，避免同屏两份「我在哪」。
 
 #[cfg(target_os = "linux")]
 use gpui::Decorations;
-use gpui::{AnyElement, App, ClickEvent, Context, SharedString, Styled, Window, div, px};
+use gpui::{AnyElement, Context, Styled, Window, div};
 
 use super::*;
-use crate::assets::ICON_TERMINAL;
-use crate::theme::{FontWeightExt, Palette};
 
 use super::about::render_about;
 use super::connections::render_connections;
+use super::extra_rules::render_extra_rules;
 use super::overview::render_overview;
 use super::profiles::render_profiles;
 use super::proxies::render_proxies;
+use super::rules::render_rules;
 use super::settings::render_settings;
 
 pub(super) fn render_page(
@@ -28,7 +31,6 @@ pub(super) fn render_page(
         .flex()
         .flex_col()
         .bg(palette.background)
-        .child(render_page_header(app, palette, cx))
         .child(
             div()
                 .id("page-scroll")
@@ -38,6 +40,8 @@ pub(super) fn render_page(
                 .child(match app.page {
                     Page::Overview => render_overview(app, palette, cx),
                     Page::Proxies => render_proxies(app, palette, cx),
+                    Page::Rules => render_rules(app, palette, cx),
+                    Page::ExtraRules => render_extra_rules(app, palette, cx),
                     Page::Connections => render_connections(app, palette, cx),
                     Page::Profiles => render_profiles(app, palette, cx),
                     Page::Settings => render_settings(app, palette, cx),
@@ -57,164 +61,4 @@ pub(super) fn render_page(
     let _ = window;
 
     page.into_any_element()
-}
-
-fn render_page_header(
-    app: &PureClash,
-    palette: Palette,
-    cx: &mut Context<PureClash>,
-) -> AnyElement {
-    div()
-        .h(px(68.0))
-        .px_6()
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_between()
-        .border_b_1()
-        .border_color(palette.border)
-        .child(
-            div()
-                .child(
-                    div()
-                        .text_lg()
-                        .font_semibold()
-                        .text_color(palette.text)
-                        .child(app.page.label()),
-                )
-                .child(
-                    div()
-                        .mt_1()
-                        .text_xs()
-                        .text_color(palette.muted)
-                        .child(page_subtitle(app.page)),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(header_status_toggle(
-                    "header-system-proxy",
-                    tr("status.system_proxy"),
-                    app.system_proxy,
-                    palette,
-                    cx.listener(|this, _, _, cx| this.toggle_system_proxy(cx)),
-                ))
-                .child(header_status_toggle(
-                    "header-tun",
-                    tr("status.tun"),
-                    app.tun_switch_state(),
-                    palette,
-                    cx.listener(|this, _, _, cx| this.toggle_tun(cx)),
-                ))
-                .child(
-                    div()
-                        .id("toggle-core-header")
-                        .h(px(30.0))
-                        .px_3()
-                        .rounded_sm()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .cursor_pointer()
-                        .bg(if app.mihomo_running() {
-                            palette.surface
-                        } else {
-                            palette.accent
-                        })
-                        .border_1()
-                        .border_color(if app.mihomo_running() {
-                            palette.border
-                        } else {
-                            palette.accent
-                        })
-                        .text_xs()
-                        .font_medium()
-                        .text_color(if app.mihomo_running() {
-                            palette.text
-                        } else {
-                            palette.surface
-                        })
-                        .child(icon(ICON_TERMINAL, palette.muted, 13.0))
-                        .child(if app.mihomo_running() {
-                            tr("app.stop")
-                        } else {
-                            tr("app.start")
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_core(cx))),
-                ),
-        )
-        .into_any_element()
-}
-
-fn page_subtitle(page: Page) -> SharedString {
-    match page {
-        Page::Overview => tr("page.overview_subtitle"),
-        Page::Proxies => tr("page.proxies_subtitle"),
-        Page::Connections => tr("page.connections_subtitle"),
-        Page::Profiles => tr("page.profiles_subtitle"),
-        Page::Settings => tr("page.settings_subtitle"),
-        Page::About => tr("page.about_subtitle"),
-    }
-}
-
-/// 页头的系统代理 / TUN 开关芯片：状态一眼可见，点击直接启停。
-#[allow(clippy::type_complexity)]
-fn header_status_toggle(
-    id: &'static str,
-    label: SharedString,
-    state: impl Into<SwitchState>,
-    palette: Palette,
-    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let state = state.into();
-    let enabled = state == SwitchState::On;
-    let pending = state == SwitchState::Starting;
-    div()
-        .id(id)
-        .h(px(28.0))
-        .px_2()
-        .rounded_sm()
-        .flex()
-        .items_center()
-        .gap_2()
-        .when(!pending, |chip| {
-            chip.cursor_pointer()
-                .hover(|style| style.bg(palette.surface_alt))
-                .on_click(on_toggle)
-        })
-        .bg(if pending {
-            palette.accent_soft
-        } else if enabled {
-            palette.success_soft
-        } else {
-            palette.surface
-        })
-        .border_1()
-        .border_color(if pending {
-            palette.accent
-        } else if enabled {
-            palette.success
-        } else {
-            palette.border
-        })
-        .text_xs()
-        .text_color(if pending {
-            palette.accent
-        } else if enabled {
-            palette.success
-        } else {
-            palette.muted
-        })
-        .child(div().size_2().rounded_full().bg(if pending {
-            palette.accent
-        } else if enabled {
-            palette.success
-        } else {
-            palette.border
-        }))
-        .child(format!("{} {}", label, state.label()))
-        .into_any_element()
 }

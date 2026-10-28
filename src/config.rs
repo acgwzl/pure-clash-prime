@@ -45,10 +45,11 @@ impl Language {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Theme {
-    /// 深色主题。
-    Dark,
-    /// 浅色主题，也是首次启动时的默认值。
+    /// 深色主题「午夜仪表」，也是首次启动时的默认值：
+    /// 客户端常驻后台、夜间瞄一眼的频率最高，深色是主场景。
     #[default]
+    Dark,
+    /// 浅色主题「纸白控制台」，可在设置里切换。
     Light,
 }
 
@@ -62,6 +63,79 @@ impl Theme {
             Self::Dark => Self::Light,
             Self::Light => Self::Dark,
         }
+    }
+}
+
+/// 订阅/导入配置的元数据；YAML 内容按 id 存放在 config/profiles/ 目录。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProfileMeta {
+    /// 随机生成的安全文件名；不使用用户输入，避免路径穿越。
+    pub(crate) id: String,
+    /// 界面显示名称。
+    pub(crate) name: String,
+    /// 订阅地址；本地导入的配置为 None。
+    pub(crate) url: Option<String>,
+    /// 添加时间（UNIX 秒）。
+    pub(crate) added_at: u64,
+    /// 最近一次内容更新时间（UNIX 秒）。
+    pub(crate) updated_at: u64,
+    /// 自动更新间隔（分钟）；0 表示不自动更新（默认，兼容旧配置）。
+    #[serde(default)]
+    pub(crate) update_interval_minutes: u64,
+    /// 最近一次自动更新尝试（UNIX 秒，无论成败）；失败也记录以顺延到期，
+    /// 避免失败订阅每分钟到期被反复重试。
+    #[serde(default)]
+    pub(crate) last_auto_attempt_at: u64,
+    /// 订阅流量快照；机场不返回 `subscription-userinfo` 时保持为 None，
+    /// 界面据此显示“机场未提供”，而不是把未知当成 0。
+    #[serde(default)]
+    pub(crate) usage: Option<SubscriptionUsage>,
+    /// 最近一次用量查询时间（UNIX 秒，无论成功与否）。
+    ///
+    /// 失败也必须记录：机场不提供该响应头时若只记成功，`usage` 会是永久空，
+    /// 于是每次进入配置页都重新请求一遍，等于反复骚扰同一个机场。
+    #[serde(default)]
+    pub(crate) usage_checked_at: u64,
+}
+
+/// 订阅流量与有效期快照，来自响应头 `subscription-userinfo`。
+///
+/// 字段沿用机场通用语义：`total == 0` 表示不限量（实测部分机场如此），
+/// 此时进度条不可用，只显示已用流量。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SubscriptionUsage {
+    /// 上传字节数。
+    pub(crate) upload: u64,
+    /// 下载字节数。
+    pub(crate) download: u64,
+    /// 总配额字节数；0 表示不限量。
+    pub(crate) total: u64,
+    /// 到期时间（UNIX 秒）；0 表示无到期时间。
+    pub(crate) expire_at: u64,
+    /// 抓取该快照的时间（UNIX 秒）。
+    pub(crate) fetched_at: u64,
+}
+
+impl SubscriptionUsage {
+    /// 已用字节数（上传 + 下载）。
+    pub(crate) fn used(&self) -> u64 {
+        self.upload.saturating_add(self.download)
+    }
+
+    /// 已用比例（0.0..=1.0）；不限量或配额为 0 时返回 None。
+    pub(crate) fn ratio(&self) -> Option<f32> {
+        if self.total == 0 {
+            return None;
+        }
+        Some((self.used() as f64 / self.total as f64).min(1.0) as f32)
+    }
+
+    /// 剩余天数；无到期时间时返回 None。已过期返回 0。
+    pub(crate) fn days_left(&self, now: u64) -> Option<i64> {
+        if self.expire_at == 0 {
+            return None;
+        }
+        Some(self.expire_at.saturating_sub(now) as i64 / 86_400)
     }
 }
 
@@ -85,26 +159,51 @@ pub(crate) struct CustomListener {
     pub(crate) proxy: Option<String>,
 }
 
-/// 订阅/导入配置的元数据；YAML 内容按 id 存放在 config/profiles/ 目录。
+/// 用户自定义的全局附加规则。
+///
+/// 合并运行时始终排在内核规则之前：Clash 顺序匹配、先中者胜，追加在订阅的
+/// MATCH 之后等于永不生效，而用户规则的意义正是覆盖订阅行为。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ProfileMeta {
-    /// 随机生成的安全文件名；不使用用户输入，避免路径穿越。
+pub(crate) struct ExtraRule {
+    /// 稳定标识；界面按 id 增删改，避免列表顺序变化后错位。
+    #[serde(default)]
     pub(crate) id: String,
-    /// 界面显示名称。
-    pub(crate) name: String,
-    /// 订阅地址；本地导入的配置为 None。
-    pub(crate) url: Option<String>,
-    /// 添加时间（UNIX 秒）。
-    pub(crate) added_at: u64,
-    /// 最近一次内容更新时间（UNIX 秒）。
-    pub(crate) updated_at: u64,
-    /// 自动更新间隔（分钟）；0 表示不自动更新（默认，兼容旧配置）。
+    /// 规则类型，例如 `DOMAIN-SUFFIX`；界面用列表选择而不是手打。
     #[serde(default)]
-    pub(crate) update_interval_minutes: u64,
-    /// 最近一次自动更新尝试（UNIX 秒，无论成败）；失败也记录以顺延到期，
-    /// 避免失败订阅每分钟到期被反复重试。
+    pub(crate) rule_type: String,
+    /// 规则内容，例如 `example.com`；`MATCH` 这类规则可以为空。
     #[serde(default)]
-    pub(crate) last_auto_attempt_at: u64,
+    pub(crate) payload: String,
+    /// 命中后的出口：`DIRECT`、`REJECT`，或订阅里的代理组名。
+    #[serde(default)]
+    pub(crate) target: String,
+    /// 是否进入运行时配置；关闭时规则仅保留在 app.json。
+    #[serde(default = "default_extra_rule_enabled")]
+    pub(crate) enabled: bool,
+}
+
+impl ExtraRule {
+    /// 组合成内核接受的规则文本。
+    ///
+    /// 内容为空时只写两个字段（如 `MATCH,DIRECT`），与内核规则语法一致；
+    /// 绝不产生 `TYPE,,TARGET` 这种中间空字段。
+    pub(crate) fn to_rule_text(&self) -> String {
+        if self.payload.is_empty() {
+            format!("{},{}", self.rule_type, self.target)
+        } else {
+            format!("{},{},{}", self.rule_type, self.payload, self.target)
+        }
+    }
+}
+
+/// 手写的规则条目默认启用：用户既然写下了规则，就是为了让它生效。
+fn default_extra_rule_enabled() -> bool {
+    true
+}
+
+/// base64 链接列表订阅默认自动转换：不转换则这类订阅完全不可用。
+fn default_convert_subscription() -> bool {
+    true
 }
 
 /// Pure Clash 主配置；新增字段必须提供默认值以兼容旧版配置文件。
@@ -125,12 +224,6 @@ pub(crate) struct AppConfig {
     /// 强制为每条连接匹配发起进程（注入 `find-process-mode: always`）；
     /// 关闭时不注入，使用内核默认行为。开关以此文件为唯一事实来源。
     pub(crate) find_process_always: bool,
-    /// 是否在启动与内核就绪后自动开启系统代理；随用户在界面手动开启/关闭而持久化。
-    #[serde(default)]
-    pub(crate) system_proxy: bool,
-    /// 自定义入站监听列表；支持为各端口单独设置协议类型与规则模式。
-    #[serde(default)]
-    pub(crate) listeners: Vec<CustomListener>,
     /// 订阅与导入的配置列表，按用户拖动后的展示顺序保存；新配置追加到末尾。
     pub(crate) profiles: Vec<ProfileMeta>,
     /// 当前激活的配置 id；None 表示使用内置默认配置。
@@ -138,6 +231,12 @@ pub(crate) struct AppConfig {
     /// 手动节点选择：键为完整分组名，值为完整节点名（包括 GLOBAL）；默认空映射。
     /// 跨重启及订阅更新复用同名分组，节点消失时临时使用该组第一项。
     pub(crate) selected_nodes: std::collections::BTreeMap<String, String>,
+    /// 全局附加规则；始终排在内核规则之前，用于覆盖订阅行为。
+    pub(crate) extra_rules: Vec<ExtraRule>,
+    /// 是否把 base64 节点链接列表订阅自动转换为 Clash 配置；
+    /// 关闭后这类订阅会按原样进入 YAML 管线并报错，行为与旧版一致。
+    #[serde(default = "default_convert_subscription")]
+    pub(crate) convert_base64_subscription: bool,
 }
 
 impl Default for AppConfig {
@@ -148,11 +247,11 @@ impl Default for AppConfig {
             theme: Theme::default(),
             language: Language::default(),
             find_process_always: false,
-            system_proxy: false,
-            listeners: Vec::new(),
             profiles: Vec::new(),
             active_profile: None,
             selected_nodes: Default::default(),
+            extra_rules: Vec::new(),
+            convert_base64_subscription: true,
         }
     }
 }
@@ -290,7 +389,7 @@ mod tests {
         let root = test_dir("create");
         let loaded = load_or_create_in(&root).expect("应完成首次配置初始化");
 
-        assert_eq!(loaded.config.theme, Theme::Light);
+        assert_eq!(loaded.config.theme, Theme::Dark);
         assert_eq!(loaded.config.language, Language::Chinese);
         assert_eq!(
             loaded.config.mihomo_version,
@@ -338,7 +437,7 @@ mod tests {
 
         fs::write(root.join("config/app.json"), "{}\n").expect("应写入缺省字段配置");
         let defaulted = load_or_create_in(&root).expect("缺少字段时应使用默认值");
-        assert_eq!(defaulted.config.theme, Theme::Light);
+        assert_eq!(defaulted.config.theme, Theme::Dark);
         assert_eq!(
             defaulted.config.mihomo_version,
             env!("PURE_CLASH_DEFAULT_MIHOMO_VERSION")
@@ -370,23 +469,6 @@ mod tests {
         assert_eq!(reloaded.config.mihomo_version, "test-version");
 
         fs::remove_dir_all(root).expect("应清理测试目录");
-    }
-
-    #[test]
-    fn system_proxy_state_survives_config_save_and_legacy_defaults() {
-        let empty_config: AppConfig = serde_json::from_str("{}").unwrap();
-        assert!(!empty_config.system_proxy);
-        assert!(!AppConfig::default().system_proxy);
-
-        let mut config = AppConfig::default();
-        config.system_proxy = true;
-        let root = test_dir("system-proxy-config");
-        fs::create_dir_all(&root).unwrap();
-        let file = root.join("app.json");
-        config.save(&file).unwrap();
-        let restored: AppConfig = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
-        assert!(restored.system_proxy);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -27,6 +27,9 @@ pub(crate) struct Controller {
     slow_agent: ureq::Agent,
     /// 热重载可能让内核重新读取 Geo 数据，超时对齐 Clash Verge Rev 给足 60 秒。
     reload_agent: ureq::Agent,
+    /// 整组延迟测试专用：节点越多探测越久，且长请求期间对端可能关闭
+    /// keep-alive 连接，因此既放宽超时，也不复用连接。
+    bulk_agent: ureq::Agent,
 }
 
 impl Controller {
@@ -42,12 +45,20 @@ impl Controller {
         let reload_agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(60))
             .build();
+        let bulk_agent = ureq::AgentBuilder::new()
+            // 实测组内单个节点最快也要近百毫秒，慢节点会吃满 5 秒内核预算，
+            // 分组可达数十个节点，共用 10 秒会让客户端先于内核超时。
+            .timeout(Duration::from_secs(120))
+            // 关闭连接复用：长请求期间对端会关闭空闲连接，复用即报连接级失败。
+            .max_idle_connections(0)
+            .build();
         Self {
             base_url: format!("http://{}", baseline.controller_addr),
             secret: baseline.secret.clone(),
             agent,
             slow_agent,
             reload_agent,
+            bulk_agent,
         }
     }
 
@@ -68,20 +79,6 @@ impl Controller {
             .into_json()
             .context("controller 版本响应格式无效")?;
         Ok(value.version)
-    }
-
-    /// 经专用 SOCKS 入口访问本机 controller，确认认证和 TCP 转发均可用，不访问外网。
-    pub(crate) fn check_subscription_direct(&self, proxy: &str) -> Result<()> {
-        let mut direct = self.clone();
-        direct.agent = ureq::AgentBuilder::new()
-            .try_proxy_from_env(false)
-            .timeout_connect(Duration::from_secs(1))
-            .timeout(Duration::from_secs(1))
-            .redirects(0)
-            .proxy(ureq::Proxy::new(proxy).context("订阅直连入口地址无效")?)
-            .build();
-        direct.version().context("订阅直连入口不可用")?;
-        Ok(())
     }
 
     /// 读取当前运行配置摘要；目前客户端只关心运行模式。
@@ -228,6 +225,20 @@ impl Controller {
         Ok(value.into())
     }
 
+    /// 读取内核规则快照。数组顺序即内核的匹配顺序，规则页据此展示优先级。
+    pub(crate) fn rules(&self) -> Result<RulesSnapshot> {
+        let value: RulesResponse = self
+            .agent
+            .get(&format!("{}/rules", self.base_url))
+            .set("Authorization", &self.authorization())
+            .call()
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("无法读取规则数据")?
+            .into_json()
+            .context("controller 规则响应格式无效")?;
+        Ok(RulesSnapshot { rules: value.rules })
+    }
+
     /// 关闭单个连接。
     pub(crate) fn close_connection(&self, id: &str) -> Result<()> {
         self.agent
@@ -254,19 +265,37 @@ impl Controller {
         Ok(())
     }
 
+    /// 延迟测试专用请求：内核重启窗口内 socket 会短暂不可达，重试一次即可跨越。
+    ///
+    /// `CoreState::Running` 只表示 controller 曾经就绪，不保证此刻仍在 accept：
+    /// 切换配置、热重载与 TUN 切换都会短暂重建监听。连接被拒时 ureq 的错误文本
+    /// 就是请求 URL，对用户没有意义，因此这里重试，并把最终失败换成可读文案。
+    fn delay_get(&self, agent: &ureq::Agent, path: &str) -> Result<ureq::Response> {
+        let url = format!("{}{path}", self.base_url);
+        let attempt = || {
+            agent
+                .get(&url)
+                .set("Authorization", &self.authorization())
+                .call()
+        };
+        match attempt() {
+            Ok(response) => Ok(response),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(DELAY_RETRY_DELAY_MS));
+                attempt().map_err(|_| anyhow::anyhow!(DELAY_TRANSPORT_ERROR))
+            }
+        }
+    }
+
     /// 对单个代理执行延迟测试；失败（超时/拒绝）返回错误描述。
     pub(crate) fn proxy_delay(&self, name: &str) -> Result<u64> {
+        let path = format!(
+            "/proxies/{}/delay?url={}&timeout={DELAY_TIMEOUT_MS}",
+            uri_path_segment(name),
+            uri_path_segment(DELAY_TEST_URL)
+        );
         let value: DelayResponse = self
-            .slow_agent
-            .get(&format!(
-                "{}/proxies/{}/delay?url={}&timeout={DELAY_TIMEOUT_MS}",
-                self.base_url,
-                uri_path_segment(name),
-                uri_path_segment(DELAY_TEST_URL)
-            ))
-            .set("Authorization", &self.authorization())
-            .call()
-            .map_err(|error| anyhow::anyhow!("{error}"))
+            .delay_get(&self.slow_agent, &path)
             .with_context(|| format!("节点 {name} 延迟测试失败"))?
             .into_json()
             .context("延迟测试响应格式无效")?;
@@ -278,40 +307,41 @@ impl Controller {
 
     /// 对策略组内全部节点执行延迟测试；返回节点名到延迟毫秒的映射。
     pub(crate) fn group_delay(&self, name: &str) -> Result<BTreeMap<String, u64>> {
+        let path = format!(
+            "/group/{}/delay?url={}&timeout={DELAY_TIMEOUT_MS}",
+            uri_path_segment(name),
+            uri_path_segment(DELAY_TEST_URL)
+        );
         let value: BTreeMap<String, u64> = self
-            .slow_agent
-            .get(&format!(
-                "{}/group/{}/delay?url={}&timeout={DELAY_TIMEOUT_MS}",
-                self.base_url,
-                uri_path_segment(name),
-                uri_path_segment(DELAY_TEST_URL)
-            ))
-            .set("Authorization", &self.authorization())
-            .call()
-            .map_err(|error| anyhow::anyhow!("{error}"))
+            .delay_get(&self.bulk_agent, &path)
             .with_context(|| format!("策略组 {name} 延迟测试失败"))?
             .into_json()
             .context("策略组延迟测试响应格式无效")?;
         Ok(value)
     }
 
-    /// 下载订阅内容；带体积上限，返回 UTF-8 文本。
-    pub(crate) fn download_subscription(url: &str, proxy: Option<&str>) -> Result<String> {
-        // 显式选择此轮出口，不继承进程环境中的代理；TUN 直连由专用 DIRECT 入口承担。
-        let mut builder = ureq::AgentBuilder::new()
-            .try_proxy_from_env(false)
+    /// 下载订阅并同时取回流量快照；机场不返回该响应头时快照为 `None`。
+    ///
+    /// `subscription-userinfo` 是机场通用约定，不是所有机场都提供，因此缺失
+    /// 属于正常情况：调用方保留原有快照而不是清空，避免一次无头响应把已有
+    /// 用量抹掉。
+    pub(crate) fn download_subscription_with_usage(
+        url: &str,
+    ) -> Result<(String, Option<crate::config::SubscriptionUsage>)> {
+        let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60));
-        if let Some(proxy) = proxy {
-            builder = builder.proxy(ureq::Proxy::new(proxy).context("订阅下载代理地址无效")?);
-        }
-        let agent = builder.build();
+            .timeout(Duration::from_secs(60))
+            .build();
         let response = agent
             .get(url)
             .set("User-Agent", "clash.meta/pure-clash")
             .call()
             .map_err(|error| anyhow::anyhow!("{error}"))
             .context("订阅下载失败")?;
+
+        let usage = response
+            .header("subscription-userinfo")
+            .and_then(parse_subscription_userinfo);
 
         let length = response
             .header("Content-Length")
@@ -329,12 +359,91 @@ impl Controller {
             bail!("订阅内容超过 10MB 体积上限");
         }
 
-        String::from_utf8(body).map_err(|_| anyhow::anyhow!("订阅内容不是有效的 UTF-8 文本"))
+        let text = String::from_utf8(body)
+            .map_err(|_| anyhow::anyhow!("订阅内容不是有效的 UTF-8 文本"))?;
+        Ok((text, usage))
+    }
+
+    /// 只读取订阅的用量响应头，不消费正文。
+    ///
+    /// 与 `download_subscription_with_usage` 的区别：这里不做体积校验也不读
+    /// 正文，因为调用方只要用量（配置页展示用），不需要内容。
+    pub(crate) fn fetch_subscription_usage(
+        url: &str,
+    ) -> Result<Option<crate::config::SubscriptionUsage>> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build();
+        let response = agent
+            .get(url)
+            .set("User-Agent", "clash.meta/pure-clash")
+            .call()
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("订阅用量查询失败")?;
+        Ok(response
+            .header("subscription-userinfo")
+            .and_then(parse_subscription_userinfo))
     }
 
     fn authorization(&self) -> String {
         format!("Bearer {}", self.secret)
     }
+}
+
+/// 解析响应头 `subscription-userinfo`。
+///
+/// 约定格式为 `key=value; key=value`（例如
+/// `upload=1; download=2; total=3; expire=1700000000`）。缺失或非法字段按 0
+/// 处理；整段解析不出任何已知键时返回 `None`，让调用方区分“机场没给”与
+/// “给了但全是 0”。
+fn parse_subscription_userinfo(raw: &str) -> Option<crate::config::SubscriptionUsage> {
+    let mut upload = 0u64;
+    let mut download = 0u64;
+    let mut total = 0u64;
+    let mut expire_at = 0u64;
+    let mut recognized = false;
+    for field in raw.split(';') {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        // 机场可能给出带小数的字节数，取整数部分即可满足展示精度。
+        let parsed = value
+            .split('.')
+            .next()
+            .and_then(|head| head.parse::<u64>().ok());
+        let Some(parsed) = parsed else {
+            continue;
+        };
+        match key.as_str() {
+            "upload" => {
+                upload = parsed;
+                recognized = true;
+            }
+            "download" => {
+                download = parsed;
+                recognized = true;
+            }
+            "total" => {
+                total = parsed;
+                recognized = true;
+            }
+            "expire" => {
+                expire_at = parsed;
+                recognized = true;
+            }
+            _ => {}
+        }
+    }
+    recognized.then(|| crate::config::SubscriptionUsage {
+        upload,
+        download,
+        total,
+        expire_at,
+        fetched_at: crate::profile::now_secs(),
+    })
 }
 
 /// 运行模式；与 controller 的 `mode` 字段一一对应。
@@ -380,6 +489,15 @@ pub(crate) struct ConfigSnapshot {
 
 /// 延迟测试的内核侧超时；与主流面板默认值一致。
 pub(crate) const DELAY_TIMEOUT_MS: u64 = 5000;
+
+/// 延迟测试的传输层失败文案。
+///
+/// ureq 的传输错误 Display 只给出请求 URL：把百分号编码的地址甩给用户等于
+/// 没有提示，也解释不了失败原因；这里换成可读说明。
+pub(crate) const DELAY_TRANSPORT_ERROR: &str = "测速请求未能送达内核：超时或被拒绝";
+
+/// 连接被拒后重试前的等待；内核重建监听通常在数秒内完成。
+pub(crate) const DELAY_RETRY_DELAY_MS: u64 = 400;
 
 /// controller `/connections` 响应。
 #[derive(Deserialize)]
@@ -428,7 +546,9 @@ pub(crate) struct ConnectionItem {
     pub(crate) chains: Vec<String>,
     #[serde(default)]
     pub(crate) rule: String,
-    #[serde(default)]
+    /// 内核 JSON 字段是驼峰 `rulePayload`；漏掉显式映射会让规则内容静默丢失，
+    /// 使「规则」列只剩类型、规则页的命中统计恒为空。
+    #[serde(rename = "rulePayload", default)]
     pub(crate) rule_payload: String,
     #[serde(default)]
     pub(crate) metadata: ConnectionMetadata,
@@ -478,6 +598,72 @@ pub(crate) struct ConnectionMetadata {
     pub(crate) destination_port: String,
     #[serde(default)]
     pub(crate) process: String,
+}
+
+/// controller `/rules` 响应。
+#[derive(Deserialize)]
+struct RulesResponse {
+    /// 内核始终返回数组；字段缺失按空列表处理。
+    #[serde(default)]
+    rules: Vec<RuleItem>,
+}
+
+/// 规则快照。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RulesSnapshot {
+    /// 内核当前生效的规则；顺序即匹配顺序，越靠前优先级越高。
+    pub(crate) rules: Vec<RuleItem>,
+}
+
+/// 单条规则。`type` 是 Rust 关键字，用 `rule_type` 承载并映射回响应字段。
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct RuleItem {
+    #[serde(rename = "type", default)]
+    pub(crate) rule_type: String,
+    #[serde(default)]
+    pub(crate) payload: String,
+    /// 命中后的出口：代理组名、DIRECT、REJECT 或具体节点名。
+    #[serde(default)]
+    pub(crate) proxy: String,
+    /// 规则在完整规则表中的位置（0 基）。禁用规则会被内核过滤，下标因此可能
+    /// 出现空档；展示内核给出的下标比数组序号更贴近真实的匹配顺序。
+    #[serde(default)]
+    pub(crate) index: Option<u32>,
+    /// 内核侧统计；`hitCount` 是自内核启动以来的累计命中次数。
+    #[serde(default)]
+    pub(crate) extra: RuleExtra,
+}
+
+/// 规则的内核侧统计信息；目前只取累计命中次数。
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct RuleExtra {
+    #[serde(rename = "hitCount", default)]
+    pub(crate) hit_count: u64,
+}
+
+impl RuleItem {
+    /// 规则标识 `(类型, 内容)`；与连接快照的 `rule`/`rulePayload` 对齐，
+    /// 规则页用它统计活跃连接的实时命中数。
+    pub(crate) fn key(&self) -> (&str, &str) {
+        (self.rule_type.as_str(), self.payload.as_str())
+    }
+
+    /// 界面展示的序号（1 基）。内核未给出下标时回退到数组位置。
+    pub(crate) fn display_index(&self, fallback: usize) -> u32 {
+        self.index.map_or(fallback as u32 + 1, |index| index + 1)
+    }
+
+    /// 界面展示的规则内容；无内容的规则（如 MATCH）只显示类型。
+    pub(crate) fn rule_label(&self) -> String {
+        if self.rule_type.is_empty() {
+            return "—".to_owned();
+        }
+        if self.payload.is_empty() {
+            self.rule_type.clone()
+        } else {
+            format!("{} · {}", self.rule_type, self.payload)
+        }
+    }
 }
 
 /// 延迟测试响应；失败时内核可能只返回 message。
@@ -783,181 +969,58 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "使用随包 Mihomo 验证 provider 延迟加载和更新；仅使用临时回环服务"]
-    fn provider_nodes_refresh_after_delayed_loading_and_updates() {
-        use crate::{
-            mihomo::{MihomoProcess, config::ensure_baseline},
-            platform::AppPaths,
-        };
-        use std::{
-            fs,
-            io::{BufRead, BufReader, Write},
-            net::TcpListener,
-            path::PathBuf,
-            sync::mpsc,
-            thread,
-            time::Instant,
-        };
-
-        let root = std::env::temp_dir().join(format!(
-            "pure-clash-provider-refresh-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut paths = AppPaths::portable(&root);
-        paths.kernel_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel");
-        fs::create_dir_all(&paths.mihomo_config_dir).unwrap();
-        fs::create_dir_all(&paths.mihomo_data_dir).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let mut baseline = ensure_baseline(&paths).unwrap();
-        baseline.controller_addr = address.to_string();
-        let controller = Controller::new(&baseline);
-
-        let provider = TcpListener::bind("127.0.0.1:0").unwrap();
-        let provider_address = provider.local_addr().unwrap();
-        provider.set_nonblocking(true).unwrap();
-        let (requested_tx, requested_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let server = thread::spawn(move || {
-            for (index, names) in [
-                ["DEMO-A", "DEMO-B"],
-                ["DEMO-C", "DEMO-D"],
-                ["DEMO-A", "DEMO-B"],
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                let mut stream = loop {
-                    match provider.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "provider 请求超时");
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(error) => panic!("provider 接收失败：{error}"),
-                    }
-                };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut reader = BufReader::new(&stream);
-                loop {
-                    let mut line = String::new();
-                    assert!(reader.read_line(&mut line).unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
-                if index == 0 {
-                    // 先让 controller 可用，暂不返回节点，稳定重现启动时的空快照。
-                    requested_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                }
-                let body = format!(
-                    "proxies:\n- {{name: {}, type: socks5, server: 192.0.2.1, port: 443}}\n- {{name: {}, type: socks5, server: 192.0.2.2, port: 443}}\n",
-                    names[0], names[1]
-                );
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-
-        // 不开启代理监听、DNS 或 TUN；节点为文档保留地址，也不进行测速。
-        let runtime = format!(
-            "mixed-port: 0\nexternal-controller: {address}\nsecret: {}\nmode: rule\nprofile:\n  store-selected: false\nproxy-providers:\n  demo:\n    type: http\n    url: http://{provider_address}/provider.yaml\n    path: ./provider.yaml\n    interval: 3600\n    health-check:\n      enable: false\nproxy-groups:\n- name: DEMO-GROUP\n  type: select\n  use: [demo]\nrules:\n- MATCH,DIRECT\n",
-            baseline.secret
-        );
-        fs::write(&paths.runtime_mihomo_config_file, runtime).unwrap();
-        let mut process = MihomoProcess::start(
-            &paths,
-            env!("PURE_CLASH_DEFAULT_MIHOMO_VERSION"),
-            &paths.runtime_mihomo_config_file,
-            false,
-            true,
-        )
-        .unwrap();
-        requested_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        controller.version().unwrap();
-        let selections = BTreeMap::from([("DEMO-GROUP".into(), "DEMO-B".into())]);
-        // 与应用同步路径相同：先恢复记忆，再读取当前模式和代理快照。
-        let refresh = || {
-            controller.restore_proxy_selections(&selections).unwrap();
-            let mode = controller.configs().unwrap().mode;
-            controller
-                .proxies(mode)
-                .unwrap()
-                .groups
-                .into_iter()
-                .find(|group| group.name == "DEMO-GROUP")
-                .unwrap()
-        };
-        let early = refresh();
-        assert_eq!(
-            early
-                .nodes
-                .iter()
-                .map(|node| node.name.as_str())
-                .collect::<Vec<_>>(),
-            ["COMPATIBLE"]
-        );
-        release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let group = refresh();
-            if group.now == "DEMO-B" {
-                assert_eq!(
-                    group
-                        .nodes
-                        .iter()
-                        .map(|node| node.name.as_str())
-                        .collect::<Vec<_>>(),
-                    ["DEMO-A", "DEMO-B"]
-                );
-                break;
-            }
-            assert!(Instant::now() < deadline, "provider 加载后未恢复记忆节点");
-            thread::sleep(Duration::from_millis(50));
-        }
-        for (members, selected) in [
-            (["DEMO-C", "DEMO-D"], "DEMO-C"),
-            (["DEMO-A", "DEMO-B"], "DEMO-B"),
-        ] {
-            // provider 独立更新，不重载配置、不重启内核，也不修改用户记忆。
-            controller
-                .agent
-                .put(&format!("{}/providers/proxies/demo", controller.base_url))
-                .set("Authorization", &controller.authorization())
-                .call()
-                .unwrap();
-            let group = refresh();
-            assert_eq!(
-                group
-                    .nodes
-                    .iter()
-                    .map(|node| node.name.as_str())
-                    .collect::<Vec<_>>(),
-                members
-            );
-            assert_eq!(group.now, selected);
-            assert_eq!(selections["DEMO-GROUP"], "DEMO-B");
-        }
-        process.stop().unwrap();
-        server.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn group_type_detection() {
         assert!(is_group_type("Selector"));
         assert!(is_group_type("URLTest"));
         assert!(!is_group_type("Vless"));
         assert!(!is_group_type("Shadowsocks"));
+    }
+
+    #[test]
+    fn parses_subscription_userinfo_header() {
+        let usage =
+            parse_subscription_userinfo("upload=100; download=200; total=1000; expire=1700000000")
+                .expect("完整响应头应解析成功");
+        assert_eq!(usage.upload, 100);
+        assert_eq!(usage.download, 200);
+        assert_eq!(usage.total, 1000);
+        assert_eq!(usage.expire_at, 1_700_000_000);
+        assert_eq!(usage.used(), 300);
+        assert_eq!(usage.ratio(), Some(0.3));
+    }
+
+    #[test]
+    fn tolerates_missing_and_odd_userinfo_fields() {
+        // 只给部分字段：缺失项按 0，仍算识别成功。
+        let partial = parse_subscription_userinfo("download=2048").expect("部分字段应可解析");
+        assert_eq!(partial.download, 2048);
+        assert_eq!(partial.total, 0);
+        // 不限量机场：total=0 时没有可用进度条。
+        assert_eq!(partial.ratio(), None);
+        // 完全无关的内容不应被当成用量。
+        assert!(parse_subscription_userinfo("hello").is_none());
+        assert!(parse_subscription_userinfo("").is_none());
+        // 带小数的字节数与大小写混排也要能吃下。
+        let odd = parse_subscription_userinfo("UPLOAD=1.5; Download=2.9; TOTAL=10").unwrap();
+        assert_eq!(odd.upload, 1);
+        assert_eq!(odd.download, 2);
+    }
+
+    #[test]
+    fn usage_days_left_handles_expiry() {
+        let mut usage = crate::config::SubscriptionUsage {
+            upload: 0,
+            download: 0,
+            total: 100,
+            expire_at: 1_700_000_000,
+            fetched_at: 0,
+        };
+        assert_eq!(usage.days_left(1_700_000_000 - 86_400 * 3), Some(3));
+        // 已过期不返回负数。
+        assert_eq!(usage.days_left(1_700_000_000 + 10), Some(0));
+        // 无到期时间时未知。
+        usage.expire_at = 0;
+        assert_eq!(usage.days_left(1_700_000_000), None);
     }
 
     #[test]
@@ -1181,5 +1244,100 @@ mod tests {
         let mut with_payload = connection.clone();
         with_payload.rule_payload = "google".into();
         assert_eq!(with_payload.rule_label(), "Match · google");
+    }
+
+    #[test]
+    fn connection_rule_payload_parses_from_kernel_camel_case() {
+        // 回归测试：内核字段是驼峰 `rulePayload`，字段名缺显式映射就会静默丢内容。
+        // 上面的测试用结构体字面量直接赋值，绕过了反序列化；另一个 serde 测试的
+        // fixture 里规则内容恰好为空串，因此两者都无法发现该问题 —— 这里必须走
+        // 真实 JSON 解析，并且使用非空内容。
+        let connection: ConnectionItem =
+            serde_json::from_str(r#"{"rule": "DomainSuffix", "rulePayload": "example.com"}"#)
+                .unwrap();
+        assert_eq!(connection.rule, "DomainSuffix");
+        assert_eq!(connection.rule_payload, "example.com");
+        assert_eq!(connection.rule_label(), "DomainSuffix · example.com");
+    }
+
+    #[test]
+    fn rules_snapshot_parses_kernel_response() {
+        // 结构对齐 1.19.30 内核 `/rules` 响应；数组顺序即匹配顺序。
+        let body = r#"{
+            "rules": [
+                {"type": "DomainSuffix", "payload": "example.com", "proxy": "PROXY"},
+                {"type": "GeoIP", "payload": "CN", "proxy": "DIRECT"},
+                {"type": "Match", "payload": "", "proxy": "PROXY"}
+            ]
+        }"#;
+        let response: RulesResponse = serde_json::from_str(body).unwrap();
+        let snapshot = RulesSnapshot {
+            rules: response.rules,
+        };
+        assert_eq!(snapshot.rules.len(), 3);
+        assert_eq!(snapshot.rules[0].key(), ("DomainSuffix", "example.com"));
+        assert_eq!(snapshot.rules[0].rule_label(), "DomainSuffix · example.com");
+        assert_eq!(snapshot.rules[0].proxy, "PROXY");
+        // 无内容的规则（如 MATCH）只显示类型，不出现悬空分隔符。
+        assert_eq!(snapshot.rules[2].rule_label(), "Match");
+    }
+
+    #[test]
+    fn rules_snapshot_tolerates_missing_rules_field() {
+        let response: RulesResponse = serde_json::from_str("{}").unwrap();
+        assert!(
+            RulesSnapshot {
+                rules: response.rules
+            }
+            .rules
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn rule_key_aligns_with_connection_rule_fields() {
+        // 命中统计依赖两侧字段一一对齐：规则侧 `type`/`payload`，连接侧
+        // `rule`/`rulePayload`。任一侧改名或丢映射都会让命中列静默归零。
+        let rule: RuleItem =
+            serde_json::from_str(r#"{"type": "DomainSuffix", "payload": "example.com"}"#).unwrap();
+        let connection: ConnectionItem =
+            serde_json::from_str(r#"{"rule": "DomainSuffix", "rulePayload": "example.com"}"#)
+                .unwrap();
+        assert_eq!(
+            rule.key(),
+            (connection.rule.as_str(), connection.rule_payload.as_str())
+        );
+        assert_eq!(rule.rule_label(), connection.rule_label());
+    }
+
+    #[test]
+    fn rules_snapshot_parses_real_kernel_payload_with_stats() {
+        // 原文来自 1.19.30 内核实机 `GET /rules`（默认配置只有一条 MATCH 规则）。
+        // 该响应还带 size / hitAt / missCount 等本客户端不使用的字段，解析必须忽略。
+        let body = r#"{"rules":[{"index":0,"type":"Match","payload":"","proxy":"PROXY",
+            "size":-1,"extra":{"disabled":false,"hitCount":0,
+            "hitAt":"1970-01-01T08:00:00+08:00","missCount":0,
+            "missAt":"1970-01-01T08:00:00+08:00"}}]}"#;
+        let response: RulesResponse = serde_json::from_str(body).unwrap();
+        let snapshot = RulesSnapshot {
+            rules: response.rules,
+        };
+        let rule = &snapshot.rules[0];
+        assert_eq!(rule.rule_type, "Match");
+        assert_eq!(rule.proxy, "PROXY");
+        assert_eq!(rule.index, Some(0));
+        assert_eq!(rule.display_index(7), 1);
+        assert_eq!(rule.extra.hit_count, 0);
+        assert_eq!(rule.rule_label(), "Match");
+    }
+
+    #[test]
+    fn rule_display_index_falls_back_to_array_position() {
+        // 内核未给出下标（旧版本或字段缺失）时回退到数组位置，仍然从 1 开始。
+        let rule: RuleItem = serde_json::from_str(r#"{"type": "GeoIP", "payload": "CN"}"#).unwrap();
+        assert_eq!(rule.index, None);
+        assert_eq!(rule.display_index(0), 1);
+        assert_eq!(rule.display_index(4), 5);
+        assert_eq!(rule.extra.hit_count, 0);
     }
 }

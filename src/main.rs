@@ -10,6 +10,7 @@ rust_i18n::i18n!("locales", fallback = "zh-CN");
 // 日志宏经 #[macro_use] 提供给后续声明的所有模块使用。
 #[macro_use]
 mod logging;
+mod subscription;
 mod app;
 mod assets;
 mod config;

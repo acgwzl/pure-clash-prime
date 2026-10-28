@@ -5,9 +5,9 @@ use rust_i18n::t;
 
 use super::overview::integration_error_banner;
 use super::*;
-use crate::assets::{ICON_MESSAGE, ICON_WINDOW_CLOSE};
+use crate::assets::ICON_WINDOW_CLOSE;
 use crate::mihomo::controller::ConnectionItem;
-use crate::theme::Palette;
+use crate::theme::{Palette, TabularNums, text_size};
 
 pub(super) fn render_connections(
     app: &PureClash,
@@ -16,75 +16,67 @@ pub(super) fn render_connections(
 ) -> AnyElement {
     div()
         .p_6()
+        .flex()
+        .flex_col()
+        .gap_4()
         .when_some(app.integration_error.as_ref(), |page, error| {
             page.child(integration_error_banner(error, palette))
         })
         .child(
             div()
-                .p_4()
-                .rounded_md()
-                .bg(palette.surface)
-                .border_1()
-                .border_color(palette.border)
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(
+                    if app.connections.is_empty() {
+                        palette.muted
+                    } else {
+                        palette.success
+                    },
+                ))
                 .child(
                     div()
-                        .flex()
-                        .items_start()
-                        .justify_between()
-                        .child(section_heading(
-                            tr("connections.title"),
-                            tr("connections.detail"),
-                            ICON_MESSAGE,
-                            palette,
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(div().text_xs().text_color(palette.muted).child(
-                                    SharedString::from(format!(
-                                        "{} ↓ {} · ↑ {}",
-                                        tr("connections.total"),
-                                        format_bytes(app.download_total),
-                                        format_bytes(app.upload_total),
-                                    )),
-                                ))
-                                .child(close_all_button(app, palette, cx)),
-                        ),
+                        .text_size(px(text_size::META))
+                        .text_color(palette.faint)
+                        .child(SharedString::from(format!(
+                            "{} ↓ {} · ↑ {}",
+                            tr("connections.total"),
+                            format_bytes(app.download_total),
+                            format_bytes(app.upload_total),
+                        ))),
                 )
-                .child(connections_header(palette))
-                .children(if app.connections.is_empty() {
-                    vec![connections_empty(app, palette)]
-                } else {
-                    // 按建立时间倒序展示，最新连接在最前；超出上限的只渲染条数提示。
-                    let mut rows: Vec<AnyElement> = app
-                        .connections
-                        .iter()
-                        .rev()
-                        .take(CONNECTIONS_RENDER_LIMIT)
-                        .map(|connection| connection_row(connection, palette, cx))
-                        .collect();
-                    let remaining = app.connections.len() - rows.len();
-                    if remaining > 0 {
-                        rows.push(
-                            div()
-                                .h(px(36.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_xs()
-                                .text_color(palette.muted)
-                                .child(
-                                    t!("connections.more", count = remaining.to_string())
-                                        .into_owned(),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                    rows
-                }),
+                .child(div().flex_1())
+                .child(close_all_button(app, palette, cx)),
         )
+        .child(connections_header(palette))
+        .children(if app.connections.is_empty() {
+            vec![connections_empty(app, palette)]
+        } else {
+            // 按建立时间倒序展示，最新连接在最前；超出上限的只渲染条数提示。
+            let mut rows: Vec<AnyElement> = app
+                .connections
+                .iter()
+                .rev()
+                .take(CONNECTIONS_RENDER_LIMIT)
+                .map(|connection| connection_row(connection, palette, cx))
+                .collect();
+            let remaining = app.connections.len() - rows.len();
+            if remaining > 0 {
+                rows.push(
+                    div()
+                        .h(px(36.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(text_size::META))
+                        .text_color(palette.muted)
+                        .child(t!("connections.more", count = remaining.to_string()).into_owned())
+                        .into_any_element(),
+                );
+            }
+            rows
+        })
         .into_any_element()
 }
 
@@ -92,9 +84,9 @@ fn close_all_button(app: &PureClash, palette: Palette, cx: &mut Context<PureClas
     let available = app.mihomo_running() && !app.connections.is_empty();
     div()
         .id("connections-close-all")
-        .px_3()
-        .h(px(28.0))
-        .rounded_sm()
+        .px(px(15.0))
+        .h(px(30.0))
+        .rounded_full()
         .flex()
         .items_center()
         .map(|button| {
@@ -104,9 +96,10 @@ fn close_all_button(app: &PureClash, palette: Palette, cx: &mut Context<PureClas
                 button.opacity(0.5)
             }
         })
-        .bg(palette.surface_alt)
-        .text_xs()
-        .text_color(palette.muted)
+        // 破坏性操作用语义色软底：不抢眼，但意图明确。
+        .bg(palette.danger_soft)
+        .text_size(px(text_size::ROW))
+        .text_color(palette.danger)
         .child(tr("connections.close_all"))
         .on_click(cx.listener(|this, _, _, cx| {
             if this.mihomo_running() && !this.connections.is_empty() {
@@ -118,21 +111,31 @@ fn close_all_button(app: &PureClash, palette: Palette, cx: &mut Context<PureClas
 
 fn connections_header(palette: Palette) -> AnyElement {
     div()
-        .mt_4()
         .flex()
         .items_center()
         .gap_3()
         .px_3()
         .h(px(34.0))
-        .bg(palette.surface_alt)
-        .text_xs()
+        .rounded_lg()
+        .bg(palette.inset)
+        .text_size(px(text_size::HINT))
         .text_color(palette.muted)
         .child(div().w(px(110.0)).child(tr("connections.process")))
         .child(div().flex_1().child(tr("connections.target")))
         .child(div().w(px(80.0)).child(tr("connections.chain")))
         .child(div().w(px(110.0)).child(tr("connections.rule")))
-        .child(div().w(px(76.0)).child(tr("connections.download")))
-        .child(div().w(px(76.0)).child(tr("connections.upload")))
+        .child(
+            div()
+                .w(px(80.0))
+                .text_right()
+                .child(tr("connections.download")),
+        )
+        .child(
+            div()
+                .w(px(80.0))
+                .text_right()
+                .child(tr("connections.upload")),
+        )
         .child(div().w(px(36.0)))
         .into_any_element()
 }
@@ -175,7 +178,7 @@ pub(super) fn connection_row(
         connection.metadata.process.clone()
     };
     div()
-        .min_h(px(52.0))
+        .min_h(px(44.0))
         .px_3()
         .flex()
         .items_center()
@@ -216,15 +219,20 @@ pub(super) fn connection_row(
                 .text_color(palette.muted)
                 .child(SharedString::from(connection.rule_label())),
         )
+        // 流量按右对齐 + 等宽数字：位数对齐才能一眼比出哪条连接最费流量。
         .child(
             div()
-                .w(px(76.0))
+                .w(px(80.0))
+                .text_right()
+                .tabnum()
                 .text_color(palette.muted)
                 .child(SharedString::from(format_bytes(connection.download))),
         )
         .child(
             div()
-                .w(px(76.0))
+                .w(px(80.0))
+                .text_right()
+                .tabnum()
                 .text_color(palette.muted)
                 .child(SharedString::from(format_bytes(connection.upload))),
         )

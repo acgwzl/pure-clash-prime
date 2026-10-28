@@ -1,7 +1,7 @@
-//! 窗口框架渲染：标题栏、内核与集成状态徽标、窗口控制按钮，
+//! 窗口框架渲染：标题栏、窗口控制按钮，
 //! 以及 Linux 客户端装饰（圆角、阴影、拖拽缩放热区）。
 
-use gpui::{AnyElement, Context, SharedString, Styled, Window, div, px};
+use gpui::{AnyElement, App, ClickEvent, Context, SharedString, Styled, Window, div, px};
 
 #[cfg(target_os = "windows")]
 use gpui::WindowControlArea;
@@ -15,7 +15,7 @@ use super::*;
 use crate::assets::{ICON_APP, ICON_MOON, ICON_SUN};
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::assets::{ICON_WINDOW_CLOSE, ICON_WINDOW_MAXIMIZE, ICON_WINDOW_MINIMIZE};
-use crate::theme::{FontWeightExt, Palette};
+use crate::theme::{FontWeightExt, Palette, text_size};
 
 #[cfg(target_os = "linux")]
 pub(super) fn linux_client_side_decorations(
@@ -245,9 +245,11 @@ pub(super) fn render_titlebar(
         )
         .child(div().h_4().border_l_1().border_color(palette.border))
         .child(
+            // 当前页名用正文级字重：顶栏是「我在哪」，弱化它等于让人迷路。
             div()
-                .text_xs()
-                .text_color(palette.muted)
+                .text_size(px(text_size::PAGE_TITLE))
+                .font_semibold()
+                .text_color(palette.text)
                 .child(app.page.label()),
         );
 
@@ -268,21 +270,28 @@ pub(super) fn render_titlebar(
         .flex_none()
         .flex()
         .items_center()
-        .bg(palette.surface)
+        // 顶栏与侧栏同色：两者合成一条连续的 chrome 带，内容区因此整体「下沉」。
+        .bg(palette.sidebar)
         .border_b_1()
         .border_color(palette.border)
         .child(titlebar_content)
-        .child(core_status(app, palette))
-        .child(system_flag_pill(
+        // 全局状态放全局位置：代理 / TUN 快捷开关与内核启停常驻顶栏，
+        // 任何页面都能一眼看到、一点切换；页内因此不再需要重复的页头。
+        .child(status_chip(
+            "titlebar-system-proxy",
             tr("status.system_proxy"),
             app.system_proxy,
             palette,
+            cx.listener(|this, _, _, cx| this.toggle_system_proxy(cx)),
         ))
-        .child(system_flag_pill(
+        .child(status_chip(
+            "titlebar-tun",
             tr("status.tun"),
             app.tun_switch_state(),
             palette,
+            cx.listener(|this, _, _, cx| this.toggle_tun(cx)),
         ))
+        .child(core_toggle_button(app, palette, cx))
         .child(language_button(app.config.language, palette, cx))
         .child(theme_button(app.config.theme.is_dark(), palette, cx));
 
@@ -360,6 +369,97 @@ pub(super) fn render_titlebar(
     titlebar.into_any_element()
 }
 
+/// 顶栏状态芯片：点 = 状态色，文案 = 「名称 状态」。
+/// 待启动态用交互色描边并禁点，避免连点造成状态机抖动。
+#[allow(clippy::type_complexity)]
+fn status_chip(
+    id: &'static str,
+    label: SharedString,
+    state: impl Into<SwitchState>,
+    palette: Palette,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let state = state.into();
+    let enabled = state == SwitchState::On;
+    let pending = state == SwitchState::Starting;
+    div()
+        .id(id)
+        .h(px(26.0))
+        .px_2()
+        .mr_1()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .when(!pending, |chip| {
+            chip.cursor_pointer()
+                .hover(|style| style.bg(palette.surface_alt))
+                .on_click(on_toggle)
+        })
+        .border_1()
+        .border_color(if pending {
+            palette.accent
+        } else if enabled {
+            palette.success
+        } else {
+            palette.border
+        })
+        .text_size(px(text_size::META))
+        .text_color(if pending {
+            palette.accent
+        } else if enabled {
+            palette.success
+        } else {
+            palette.muted
+        })
+        .child(div().size_2().rounded_full().bg(if pending {
+            palette.accent
+        } else if enabled {
+            palette.success
+        } else {
+            palette.border
+        }))
+        .child(format!("{label} {}", state.label()))
+        .into_any_element()
+}
+
+/// 顶栏内核启停钮：运行中 = 嵌入底「停止」，停止 = 品牌实色「启动」。
+fn core_toggle_button(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    div()
+        .id("toggle-core-titlebar")
+        .h(px(26.0))
+        .px_3()
+        .mr_2()
+        .rounded_md()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .bg(if app.mihomo_running() {
+            palette.inset
+        } else {
+            palette.accent
+        })
+        .text_size(px(text_size::META))
+        .font_medium()
+        .text_color(if app.mihomo_running() {
+            palette.text
+        } else {
+            palette.knob
+        })
+        .child(if app.mihomo_running() {
+            tr("app.stop")
+        } else {
+            tr("app.start")
+        })
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_core(cx)))
+        .into_any_element()
+}
+
 fn language_button(
     language: Language,
     palette: Palette,
@@ -374,6 +474,7 @@ fn language_button(
         .id("titlebar-language-toggle")
         .w(px(36.0))
         .h_full()
+        .ml_2()
         .flex_none()
         .flex()
         .items_center()
@@ -404,77 +505,6 @@ fn theme_button(dark_mode: bool, palette: Palette, cx: &mut Context<PureClash>) 
         .hover(|style| style.bg(palette.surface_alt))
         .child(icon(icon_path, palette.muted, 15.0))
         .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx)))
-        .into_any_element()
-}
-
-fn core_status(app: &PureClash, palette: Palette) -> AnyElement {
-    let (label, color, dot) = match app.core_state {
-        // 运行中附带当前运行模式，如"内核运行中:[规则]"。
-        CoreState::Running => (
-            SharedString::from(format!("{}:[{}]", tr("app.core_running"), app.mode.label())),
-            palette.success,
-            palette.success,
-        ),
-        CoreState::Starting => (tr("app.core_starting"), palette.accent, palette.accent),
-        CoreState::Stopped => (tr("app.core_stopped"), palette.muted, palette.muted),
-    };
-    div()
-        .h(px(28.0))
-        .px_3()
-        .mr_2()
-        .rounded_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .bg(if app.mihomo_running() {
-            palette.success_soft
-        } else {
-            palette.surface_alt
-        })
-        .text_xs()
-        .font_medium()
-        .text_color(color)
-        .child(div().size_2().rounded_full().bg(dot))
-        .child(label)
-        .into_any_element()
-}
-
-/// 标题栏的系统代理 / TUN 状态徽标：与内核状态同款胶囊样式。
-fn system_flag_pill(
-    label: SharedString,
-    state: impl Into<SwitchState>,
-    palette: Palette,
-) -> AnyElement {
-    let state = state.into();
-    let enabled = state == SwitchState::On;
-    let pending = state == SwitchState::Starting;
-    let (color, dot) = if pending {
-        (palette.accent, palette.accent)
-    } else if enabled {
-        (palette.success, palette.success)
-    } else {
-        (palette.muted, palette.muted)
-    };
-    div()
-        .h(px(28.0))
-        .px_3()
-        .mr_2()
-        .rounded_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .bg(if pending {
-            palette.accent_soft
-        } else if enabled {
-            palette.success_soft
-        } else {
-            palette.surface_alt
-        })
-        .text_xs()
-        .font_medium()
-        .text_color(color)
-        .child(div().size_2().rounded_full().bg(dot))
-        .child(format!("{label} {}", state.label()))
         .into_any_element()
 }
 

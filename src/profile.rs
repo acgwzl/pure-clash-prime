@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
 use crate::{
-    config::ProfileMeta,
+    config::{ProfileMeta, SubscriptionUsage},
     mihomo::{
         config::{ensure_baseline, merge_runtime, validate_kernel_config, write_runtime},
         controller::{Controller, MAX_DOWNLOAD_BYTES},
@@ -56,61 +56,47 @@ pub(crate) fn now_secs() -> u64 {
 /// 校验并保存订阅/导入内容，返回合并产物供后续激活使用。
 ///
 /// 内容只有通过结构预检与内核 `-t` 校验才会落盘，失败时不产生任何残留。
+/// `convert` 开启时，base64 节点链接列表先转换为 Clash YAML 再进管线，
+/// 落盘保存的是转换产物，因此后续更新与激活走的是同一条已校验路径。
 pub(crate) fn validate_and_store(
     paths: &AppPaths,
     version: &str,
     id: &str,
     content: &str,
+    convert: bool,
 ) -> Result<String> {
+    let converted = convert
+        .then(|| crate::subscription::decode_subscription(content))
+        .flatten();
+    let effective = converted.as_deref().unwrap_or(content);
+    if converted.is_some() {
+        log_info!(
+            "subscription",
+            "订阅内容为节点链接列表，已转换为 Clash 配置"
+        );
+    }
     let baseline = ensure_baseline(paths)?;
-    let runtime = merge_runtime(content, &baseline)?;
+    let runtime = merge_runtime(effective, &baseline)?;
     validate_kernel_config(paths, version, &runtime)?;
     let profile_file = profile_yaml_path(paths, id);
-    crate::platform::file::atomic_write(&profile_file, content.as_bytes())
+    crate::platform::file::atomic_write(&profile_file, effective.as_bytes())
         .with_context(|| format!("无法写入配置：{}", profile_file.display()))?;
     Ok(runtime)
 }
 
-/// 本次下载的出口快照；只在应用代理开启时使用，不记录含凭据的代理地址。
-pub(crate) struct SubscriptionProxy {
-    pub(crate) preferred: String,
-    /// TUN 开启时必须走内核 DIRECT 专用入口，不能靠取消 HTTP 代理假装绕过 TUN。
-    pub(crate) direct: SubscriptionDirect,
-}
-
-pub(crate) enum SubscriptionDirect {
-    System,
-    Proxy(String),
-    Unavailable,
-}
-
-/// 先代理后直连；只有两次下载均失败才返回错误。后续 YAML 校验失败不触发网络重试。
-pub(crate) fn download_subscription(
+/// 下载订阅并同时取回流量快照；机场不返回 `subscription-userinfo` 时为 `None`。
+pub(crate) fn download_subscription_with_usage(
     url: &str,
-    proxy: Option<&SubscriptionProxy>,
-) -> Result<String> {
-    let download = |route: Option<&str>| {
-        Controller::download_subscription(url, route)
-            .map_err(|error| anyhow::anyhow!("{}", crate::logging::redact(&format!("{error:#}"))))
-    };
-    let Some(proxy) = proxy else {
-        return download(None);
-    };
-    let proxy_error = match download(Some(&proxy.preferred)) {
-        Ok(content) => return Ok(content),
-        Err(error) => error,
-    };
-    log_info!("profile", "订阅代理下载失败，尝试直连");
-    let result = match &proxy.direct {
-        SubscriptionDirect::System => download(None),
-        SubscriptionDirect::Proxy(route) => download(Some(route)),
-        SubscriptionDirect::Unavailable => {
-            Err(anyhow::anyhow!("订阅直连入口未就绪，请重启内核后重试"))
-        }
-    };
-    result.map_err(|direct_error| {
-        anyhow::anyhow!("订阅下载失败；代理：{proxy_error:#}；直连：{direct_error:#}")
-    })
+) -> Result<(String, Option<SubscriptionUsage>)> {
+    Controller::download_subscription_with_usage(url)
+}
+
+/// 只取订阅的用量响应头，不读取正文。
+///
+/// 用量在 `subscription-userinfo` 响应头里，完整下载一份动辄几十 KB，
+/// 只为拿一个头部不值得，因此拿到响应头即丢弃响应的其余部分。
+pub(crate) fn fetch_subscription_usage(url: &str) -> Result<Option<SubscriptionUsage>> {
+    Controller::fetch_subscription_usage(url)
 }
 
 /// 读取用户选择的本地 Mihomo YAML；沿用订阅 10MB 上限并要求 UTF-8 文本。
@@ -253,33 +239,6 @@ pub(crate) fn prepare_runtime(
     Ok(runtime)
 }
 
-/// 只在内核停止后准备专用端口；运行中的配置合并和热重载不能换端口。
-pub(crate) fn prepare_subscription_direct_startup(
-    paths: &AppPaths,
-    baseline: &mut crate::mihomo::config::LocalBaseline,
-    version: &str,
-    active_id: Option<&str>,
-) -> Result<Option<std::net::TcpListener>> {
-    use crate::mihomo::config::save_baseline;
-    let mut desired = baseline.clone();
-    let reservation = desired.reserve_subscription_direct_port()?;
-    if desired.subscription_direct_port != baseline.subscription_direct_port {
-        let runtime = prepare_runtime(paths, Some(&desired), version, active_id)?;
-        save_baseline(paths, &desired)?;
-        if let Err(error) = write_runtime(paths, &runtime) {
-            return match save_baseline(paths, baseline) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(anyhow::anyhow!(
-                    "{error:#}；恢复原本地基线也失败：{rollback_error:#}"
-                )),
-            };
-        }
-        log_info!("profile", "订阅直连端口被占用，已改用空闲端口");
-        *baseline = desired;
-    }
-    Ok(reservation)
-}
-
 /// 创建订阅类型配置的元数据。
 pub(crate) fn subscription_meta(name: String, url: String) -> ProfileMeta {
     let now = now_secs();
@@ -291,6 +250,8 @@ pub(crate) fn subscription_meta(name: String, url: String) -> ProfileMeta {
         updated_at: now,
         update_interval_minutes: 0,
         last_auto_attempt_at: 0,
+        usage: None,
+        usage_checked_at: 0,
     }
 }
 
@@ -305,6 +266,9 @@ pub(crate) fn local_meta(name: String) -> ProfileMeta {
         updated_at: now,
         update_interval_minutes: 0,
         last_auto_attempt_at: 0,
+        // 本地导入的配置没有订阅地址，也就不存在流量信息。
+        usage: None,
+        usage_checked_at: 0,
     }
 }
 
@@ -313,6 +277,25 @@ pub(crate) fn local_meta(name: String) -> ProfileMeta {
 pub(crate) const MIN_UPDATE_INTERVAL_MINUTES: u64 = if cfg!(debug_assertions) { 1 } else { 10 };
 /// 自动更新间隔上限（分钟），30 天。
 pub(crate) const MAX_UPDATE_INTERVAL_MINUTES: u64 = 43_200;
+
+/// 订阅用量快照的刷新间隔；超过后再次进入配置文件页会重新查询。
+///
+/// 用量是慢变量（机场按小时/天结算），不必每次切页都请求一遍。
+pub(crate) const USAGE_REFRESH_SECS: u64 = 3_600;
+
+/// 该订阅的用量是否需要刷新：没有快照，或快照早于刷新间隔。
+///
+/// 历史订阅的 `usage` 为空（字段后加），不补齐就永远显示「用量未知」。
+pub(crate) fn usage_needs_refresh(meta: &ProfileMeta, now: u64) -> bool {
+    // 本地导入的配置没有订阅地址，也就查不到用量。
+    if meta.url.is_none() {
+        return false;
+    }
+    // 以最近一次查询为准，而不是最近一次成功：机场不提供响应头时也要顺延。
+    let from_snapshot = meta.usage.as_ref().map_or(0, |usage| usage.fetched_at);
+    let last_checked = from_snapshot.max(meta.usage_checked_at);
+    last_checked == 0 || now.saturating_sub(last_checked) >= USAGE_REFRESH_SECS
+}
 
 /// 解析用户输入的自动更新间隔：`0` 表示关闭，其余必须落在
 /// [`MIN_UPDATE_INTERVAL_MINUTES`]..=[`MAX_UPDATE_INTERVAL_MINUTES`]。
@@ -354,265 +337,30 @@ pub(crate) fn subscription_due(meta: &ProfileMeta, now: u64) -> bool {
 mod tests {
     use super::*;
 
-    /// 一次性本机 HTTP 服务，也可模拟 HTTP 代理；超时退出避免测试失败后遗留线程。
-    fn subscription_server(status: u16, body: &str) -> (String, std::thread::JoinHandle<String>) {
-        use std::{
-            io::{BufRead, BufReader, Write},
-            net::TcpListener,
-            time::{Duration, Instant},
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let body = body.to_owned();
-        let task = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "未收到测试订阅请求");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("{error}"),
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut headers = String::new();
-            loop {
-                let mut line = String::new();
-                assert!(reader.read_line(&mut line).unwrap() > 0);
-                headers.push_str(&line);
-                if line == "\r\n" {
-                    if headers.starts_with("CONNECT ") && status == 200 {
-                        stream
-                            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                            .unwrap();
-                        headers.clear();
-                    } else {
-                        break;
-                    }
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-            headers
+    #[test]
+    fn usage_refresh_covers_missing_stale_local_and_in_flight() {
+        let now = 100_000;
+        let mut meta = due_meta(60, 0, 0);
+        // 历史订阅没有快照也没有查询记录：必须补齐，否则一直显示「用量未知」。
+        assert!(usage_needs_refresh(&meta, now));
+        // 刚查过但机场没给用量：也要顺延，否则每次进页面都重新请求一遍。
+        meta.usage_checked_at = now;
+        assert!(!usage_needs_refresh(&meta, now));
+        assert!(usage_needs_refresh(&meta, now + USAGE_REFRESH_SECS));
+        // 有快照时同样以最近一次查询为准。
+        meta.usage = Some(SubscriptionUsage {
+            upload: 1,
+            download: 2,
+            total: 3,
+            expire_at: 0,
+            fetched_at: now,
         });
-        (format!("http://{address}"), task)
-    }
-
-    #[test]
-    fn subscription_download_prefers_proxy_without_direct_request() {
-        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        origin.set_nonblocking(true).unwrap();
-        let (proxy, task) = subscription_server(200, "proxies: []");
-        let route = SubscriptionProxy {
-            preferred: proxy,
-            direct: SubscriptionDirect::System,
-        };
-        let url = format!("http://{}/subscription", origin.local_addr().unwrap());
-        assert_eq!(
-            download_subscription(&url, Some(&route)).unwrap(),
-            "proxies: []"
-        );
-        task.join().unwrap();
-        assert_eq!(
-            origin.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-    }
-
-    #[test]
-    fn subscription_download_retries_direct_and_redacts_combined_errors() {
-        for status in [200, 503] {
-            let (proxy, proxy_task) = subscription_server(502, "");
-            let (origin, origin_task) = subscription_server(status, "proxies: []");
-            let route = SubscriptionProxy {
-                preferred: proxy,
-                direct: SubscriptionDirect::System,
-            };
-            let result = download_subscription(
-                &format!("{origin}/private-path?token=test-only"),
-                Some(&route),
-            );
-            if status == 200 {
-                assert_eq!(result.unwrap(), "proxies: []");
-            } else {
-                let error = format!("{:#}", result.unwrap_err());
-                assert!(error.contains("代理") && error.contains("直连"));
-                assert!(!error.contains("private-path") && !error.contains("test-only"));
-            }
-            proxy_task.join().unwrap();
-            origin_task.join().unwrap();
-        }
-        let (origin, task) = subscription_server(200, "proxies: []");
-        assert_eq!(download_subscription(&origin, None).unwrap(), "proxies: []");
-        task.join().unwrap();
-    }
-
-    #[test]
-    fn subscription_download_never_uses_system_route_when_tun_direct_is_unavailable() {
-        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        origin.set_nonblocking(true).unwrap();
-        let url = format!("http://{}/subscription", origin.local_addr().unwrap());
-        for status in [200, 502] {
-            let (proxy, task) = subscription_server(status, "proxies: []");
-            let route = SubscriptionProxy {
-                preferred: proxy,
-                direct: SubscriptionDirect::Unavailable,
-            };
-            let result = download_subscription(&url, Some(&route));
-            if status == 200 {
-                assert_eq!(result.unwrap(), "proxies: []");
-            } else {
-                assert!(format!("{:#}", result.unwrap_err()).contains("直连入口未就绪"));
-            }
-            task.join().unwrap();
-            assert_eq!(
-                origin.accept().unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "使用随包内核验证订阅 DIRECT 重试；只启动回环服务，不启用系统 TUN"]
-    fn subscription_direct_retry_bypasses_global_and_rule_modes() {
-        use crate::mihomo::{
-            MihomoProcess,
-            config::{merge_runtime, validate_kernel_config, write_runtime},
-        };
-        use std::{net::TcpListener, path::Path, time::Duration};
-        let root = std::env::temp_dir().join(format!("pure-clash-direct-retry-{}", Uuid::new_v4()));
-        let mut paths = AppPaths::portable(&root);
-        paths.kernel_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
-        fs::create_dir_all(&paths.mihomo_config_dir).unwrap();
-        fs::create_dir_all(&paths.mihomo_data_dir).unwrap();
-        let mut baseline = ensure_baseline(&paths).unwrap();
-        let controller_port = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mixed_port = TcpListener::bind("127.0.0.1:0").unwrap();
-        baseline.controller_addr = controller_port.local_addr().unwrap().to_string();
-        baseline.mixed_port = mixed_port.local_addr().unwrap().port();
-        baseline.tun_enable = true;
-        let version = env!("PURE_CLASH_DEFAULT_MIHOMO_VERSION");
-        // 模拟上次保存的端口已被其他程序占用，走实际启动前的端口迁移与落盘流程。
-        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-        baseline.subscription_direct_port = occupied.local_addr().unwrap().port();
-        crate::mihomo::config::save_baseline(&paths, &baseline).unwrap();
-        fs::write(
-            &paths.default_mihomo_config_file,
-            "rules:\n- MATCH,REJECT\n",
-        )
-        .unwrap();
-        let reservation =
-            prepare_subscription_direct_startup(&paths, &mut baseline, version, None).unwrap();
-        assert_ne!(
-            baseline.subscription_direct_port,
-            occupied.local_addr().unwrap().port()
-        );
-        assert_eq!(ensure_baseline(&paths).unwrap(), baseline);
-        let runtime = fs::read_to_string(&paths.runtime_mihomo_config_file).unwrap();
-        assert_eq!(
-            runtime,
-            merge_runtime("rules:\n- MATCH,REJECT\n", &baseline).unwrap()
-        );
-        validate_kernel_config(&paths, version, &runtime).unwrap();
-        let mut runtime: serde_yaml::Value = serde_yaml::from_str(&runtime).unwrap();
-        // 保留生产 DIRECT 入口，但不改系统路由，也不访问任何公共 DNS 或订阅。
-        runtime["tun"]["enable"] = false.into();
-        runtime["dns"]["enable"] = false.into();
-        runtime["rules"] = serde_yaml::to_value(vec!["MATCH,REJECT"]).unwrap();
-        write_runtime(&paths, &serde_yaml::to_string(&runtime).unwrap()).unwrap();
-        drop(controller_port);
-        drop(mixed_port);
-        drop(reservation);
-        let mut process = MihomoProcess::start(
-            &paths,
-            version,
-            &paths.runtime_mihomo_config_file,
-            false,
-            false,
-        )
-        .unwrap();
-        let controller = Controller::new(&baseline);
-        for _ in 0..50 {
-            if controller.version().is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        controller.select_proxy("GLOBAL", "REJECT").unwrap();
-        let direct_proxy = baseline.subscription_direct_proxy_url();
-        let route = SubscriptionProxy {
-            preferred: format!("http://127.0.0.1:{}", baseline.mixed_port),
-            direct: SubscriptionDirect::Proxy(direct_proxy.clone()),
-        };
-        for mode in ["global", "rule"] {
-            controller.patch_mode(mode).unwrap();
-            controller.check_subscription_direct(&direct_proxy).unwrap();
-            assert!(
-                controller
-                    .check_subscription_direct(&format!(
-                        "socks5://pure-clash:wrong-password@127.0.0.1:{}",
-                        baseline.subscription_direct_port
-                    ))
-                    .is_err()
-            );
-            let (origin, task) = subscription_server(200, "proxies: []");
-            // 普通入口被 REJECT 阻断，专用入口仍可下载；认证头不能传给订阅服务器。
-            assert!(Controller::download_subscription(&origin, Some(&route.preferred)).is_err());
-            assert!(
-                Controller::download_subscription(
-                    &origin,
-                    Some(&format!(
-                        "socks5://127.0.0.1:{}",
-                        baseline.subscription_direct_port
-                    ))
-                )
-                .is_err()
-            );
-            assert_eq!(
-                download_subscription(&origin, Some(&route)).unwrap(),
-                "proxies: []"
-            );
-            assert!(
-                !task
-                    .join()
-                    .unwrap()
-                    .to_lowercase()
-                    .contains("proxy-authorization")
-            );
-            assert_eq!(controller.configs().unwrap().mode.as_str(), mode);
-        }
-        // 未认证的原始 SOCKS UDP 包不能再经专用入口转发。
-        let target = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        target
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .unwrap();
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
-        packet.extend_from_slice(&target.local_addr().unwrap().port().to_be_bytes());
-        packet.extend_from_slice(b"unauthenticated-test");
-        sender
-            .send_to(&packet, ("127.0.0.1", baseline.subscription_direct_port))
-            .unwrap();
-        let error = target.recv_from(&mut [0; 128]).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ));
-        // 同一端口只有 TCP 监听，UDP 仍可绑定，避免把一次丢包误当成修复成功。
-        let _udp =
-            std::net::UdpSocket::bind(("127.0.0.1", baseline.subscription_direct_port)).unwrap();
-        process.stop().unwrap();
-        fs::remove_dir_all(root).unwrap();
+        assert!(!usage_needs_refresh(&meta, now));
+        // 边界：差一秒还不算过期。
+        assert!(!usage_needs_refresh(&meta, now + USAGE_REFRESH_SECS - 1));
+        // 本地导入没有订阅地址，不查询。
+        let local = local_meta("本地".to_owned());
+        assert!(!usage_needs_refresh(&local, now));
     }
 
     fn due_meta(interval_minutes: u64, updated_at: u64, last_attempt: u64) -> ProfileMeta {
@@ -624,6 +372,8 @@ mod tests {
             updated_at,
             update_interval_minutes: interval_minutes,
             last_auto_attempt_at: last_attempt,
+            usage: None,
+            usage_checked_at: 0,
         }
     }
 
@@ -883,12 +633,11 @@ mod tests {
         let baseline = LocalBaseline {
             mode: crate::mihomo::controller::Mode::Rule,
             mixed_port: 17890,
-            subscription_direct_port: 17899,
             controller_addr: "127.0.0.1:19098".to_owned(),
             secret: "activate-secret".to_owned(),
             tun_enable: false,
             find_process_always: false,
-            listeners: Vec::new(),
+            extra_rules: Vec::new(),
         };
         let profile_yaml = "\
 proxies:
@@ -968,9 +717,12 @@ rules:
         let version = env!("PURE_CLASH_DEFAULT_MIHOMO_VERSION");
 
         // 1. 下载真实订阅并走完整校验管线。
-        let content = download_subscription(&subscription_url, None).expect("应下载订阅");
+        let content = download_subscription_with_usage(&subscription_url)
+            .expect("应下载订阅")
+            .0;
         let id = new_profile_id();
-        let runtime = validate_and_store(&paths, version, &id, &content).expect("订阅应通过校验");
+        let runtime =
+            validate_and_store(&paths, version, &id, &content, false).expect("订阅应通过校验");
         assert!(runtime.contains(&format!("mixed-port: {proxy_port}")));
         assert!(!runtime.contains("enable: true\ntun") && !runtime.contains("tun: true"));
 

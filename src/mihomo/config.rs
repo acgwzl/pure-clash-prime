@@ -37,6 +37,8 @@ pub(crate) struct LocalBaseline {
     pub(crate) find_process_always: bool,
     /// 用户自定义入站监听列表。
     pub(crate) listeners: Vec<CustomListener>,
+    /// 已启用的全局附加规则文本；由 app.json 对齐，merge_runtime 前置到内核规则之前。
+    pub(crate) extra_rules: Vec<String>,
 }
 
 /// 读取或生成客户端本地基线文件。
@@ -66,6 +68,7 @@ pub(crate) fn ensure_baseline(paths: &AppPaths) -> Result<LocalBaseline> {
         tun_enable: false,
         find_process_always: false,
         listeners: Vec::new(),
+        extra_rules: Vec::new(),
     };
     crate::platform::file::atomic_write(file, baseline.to_yaml().as_bytes())
         .with_context(|| format!("无法写入本地基线配置：{}", file.display()))?;
@@ -409,6 +412,7 @@ fn parse_baseline(content: &str) -> Result<LocalBaseline> {
         tun_enable,
         find_process_always,
         listeners,
+        extra_rules: Vec::new(),
     })
 }
 
@@ -624,6 +628,8 @@ mod tests {
             tun_enable: false,
             find_process_always: false,
             listeners: Vec::new(),
+            extra_rules: Vec::new(),
+            extra_rules: Vec::new(),
         }
     }
 
@@ -1365,4 +1371,28 @@ rules:
         ];
         assert!(validate_listeners(7890, "127.0.0.1:9097", &valid).is_ok());
     }
+}
+
+/// 校验一条附加规则文本能否被内核接受。
+///
+/// 这里只做浅层结构校验（类型 + 内容非空 + MATCH 无内容），
+/// 真正的合法性仍由内核 `-t` 终审。
+pub(crate) fn validate_rule_text(text: &str) -> Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("规则内容不能为空");
+    }
+    let mut parts = text.split(',');
+    let rule_type = parts.next().unwrap_or("").trim();
+    if rule_type.is_empty() {
+        bail!("规则缺少类型");
+    }
+    if rule_type.eq_ignore_ascii_case("MATCH") {
+        return Ok(());
+    }
+    let payload = parts.next().unwrap_or("").trim();
+    if payload.is_empty() {
+        bail!("规则缺少匹配内容：{text}");
+    }
+    Ok(())
 }
