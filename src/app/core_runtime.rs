@@ -334,6 +334,11 @@ impl PureClash {
                         );
                         this.mode = ProxyMode::from_controller(config.mode);
                         this.groups = proxies.groups;
+                        // 规则快照不随代理轮询返回；内核就绪后补拉一次，
+                        // 否则概览页的规则计数与规则页会一直是空态。
+                        if this.rules.is_empty() && !this.rules_loading {
+                            this.fetch_rules(cx);
+                        }
                         if this.runtime_state_failing {
                             this.runtime_state_failing = false;
                             // 只清理由本次同步恢复的错误，不覆盖用户其他操作的提示。

@@ -22,6 +22,11 @@ impl PureClash {
             self.refresh_autostart_status();
         }
         self.page = page;
+        // 规则列表来自内核快照，进入页面时才拉取；已拉过则复用。
+        if page == Page::Rules && self.rules.is_empty() && !self.rules_loading && self.mihomo_running()
+        {
+            self.fetch_rules(cx);
+        }
         cx.notify();
     }
 
