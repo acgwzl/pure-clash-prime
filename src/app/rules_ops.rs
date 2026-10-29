@@ -188,7 +188,35 @@ pub(super) fn extra_rule_targets(app: &PureClash) -> Vec<String> {
 
 impl PureClash {
     /// 打开编辑器；类型与出口带默认值，减少必填项。
+    /// 进入编辑模式：把既有规则回填到表单，保存时原地更新而不是新增。
+    pub(super) fn start_edit_extra_rule(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(rule) = self.config.extra_rules.iter().find(|rule| rule.id == id) else {
+            return;
+        };
+        self.extra_rule_editor_open = true;
+        self.editing_extra_rule_id = Some(id);
+        self.extra_rule_type_picker = false;
+        self.extra_rule_target_picker = false;
+        self.extra_rule_options_shown = OPTION_PAGE_SIZE;
+        self.extra_rule_error = None;
+        self.extra_rule_notice = None;
+        self.extra_rule_type = rule.rule_type.clone();
+        self.extra_rule_target = rule.target.clone();
+        // 表单输入是「原始文本」，编辑已有规则时把三段拼回去，
+        // 识别器会照常切分；无 payload 的规则只回填目标即可。
+        let raw = if rule.payload.is_empty() {
+            rule.target.clone()
+        } else {
+            format!("{} {}", rule.payload, rule.target)
+        };
+        self.extra_rule_payload
+            .update(cx, |input, cx| input.set_content(raw, cx));
+        cx.notify();
+    }
+
     pub(super) fn open_extra_rule_editor(&mut self, cx: &mut Context<Self>) {
+        // 打开前清掉可能的编辑态：这是「新增」入口。
+        self.editing_extra_rule_id = None;
         self.extra_rule_editor_open = true;
         self.extra_rule_type_picker = false;
         self.extra_rule_target_picker = false;
@@ -210,6 +238,7 @@ impl PureClash {
     /// 关闭编辑器并收起选择列表。
     pub(super) fn close_extra_rule_editor(&mut self, cx: &mut Context<Self>) {
         self.extra_rule_editor_open = false;
+        self.editing_extra_rule_id = None;
         self.extra_rule_type_picker = false;
         self.extra_rule_target_picker = false;
         self.extra_rule_error = None;
@@ -289,9 +318,10 @@ impl PureClash {
             cx.notify();
             return;
         };
-        let rule = ExtraRule {
-            id: Uuid::new_v4().to_string(),
-            ..draft
+        // 编辑模式：沿用原 id 原地更新；新增模式生成新 id。
+        let (rule, editing) = match self.editing_extra_rule_id.clone() {
+            Some(id) => (ExtraRule { id, ..draft }, true),
+            None => (ExtraRule { id: Uuid::new_v4().to_string(), ..draft }, false),
         };
 
         if rule.rule_type.is_empty() || rule.target.is_empty() {
@@ -307,11 +337,12 @@ impl PureClash {
             return;
         }
         // 重复条目没有意义，还会让人误以为改动没生效。
+        // 编辑模式下排除自己，否则「什么都没改直接保存」会被判成重复。
         if self
             .config
             .extra_rules
             .iter()
-            .any(|existing| existing.to_rule_text() == text)
+            .any(|existing| existing.id != rule.id && existing.to_rule_text() == text)
         {
             self.extra_rule_error = Some(t!("rules.extra_duplicate").into_owned());
             cx.notify();
@@ -319,10 +350,18 @@ impl PureClash {
         }
 
         let mut desired = self.config.extra_rules.clone();
-        desired.push(rule);
+        if editing {
+            match desired.iter().position(|existing| existing.id == rule.id) {
+                Some(index) => desired[index] = rule,
+                None => desired.push(rule),
+            }
+        } else {
+            desired.push(rule);
+        }
         self.extra_rule_editor_open = false;
         self.extra_rule_type_picker = false;
         self.extra_rule_target_picker = false;
+        self.editing_extra_rule_id = None;
         self.extra_rule_payload
             .update(cx, |input, cx| input.set_content(String::new(), cx));
         self.commit_extra_rules(desired, cx);

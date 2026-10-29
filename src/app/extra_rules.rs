@@ -31,6 +31,8 @@ pub(super) fn render_extra_rules(
 
 /// 第一张卡片：说明、添加入口与编辑器。
 fn editor_card(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyElement {
+    // 编辑模式下标题与提交按钮都要说清楚在改哪一条。
+
     let total = app.config.extra_rules.len();
     let enabled = app.config.extra_rules.iter().filter(|r| r.enabled).count();
     div()
@@ -477,6 +479,7 @@ fn table_row(rule: &ExtraRule, palette: Palette, cx: &mut Context<PureClash>) ->
     let enabled = rule.enabled;
     let toggle_id = rule.id.clone();
     let remove_id = rule.id.clone();
+    let edit_id = rule.id.clone();
     div()
         .min_h(px(44.0))
         .px_3()
@@ -556,6 +559,19 @@ fn table_row(rule: &ExtraRule, palette: Palette, cx: &mut Context<PureClash>) ->
                     palette.muted
                 })
                 .child(SharedString::from(rule.target.clone())),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("extra-rule-edit-{}", rule.id)))
+                .w(px(44.0))
+                .flex()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.75))
+                .child(icon(ICON_SETTINGS, palette.muted, 13.0))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.start_edit_extra_rule(edit_id.clone(), cx);
+                })),
         )
         .child(
             div()

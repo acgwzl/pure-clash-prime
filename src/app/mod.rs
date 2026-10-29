@@ -423,6 +423,8 @@ pub(crate) struct PureClash {
     net_report: Option<crate::app::net_check::NetReport>,
     /// 网络详情弹层是否展开。
     net_dialog_open: bool,
+    /// 正在编辑的附加规则 id；None 表示编辑器处于新增模式。
+    editing_extra_rule_id: Option<String>,
     /// 关于页检查更新是否进行中。
     update_checking: bool,
     /// 检查发现新版本时置位；界面用它强调更新提示。
@@ -653,6 +655,7 @@ impl PureClash {
             net_check_auto_done: false,
             net_report: None,
             net_dialog_open: false,
+            editing_extra_rule_id: None,
             update_checking: false,
             update_available: false,
             update_status: None,
