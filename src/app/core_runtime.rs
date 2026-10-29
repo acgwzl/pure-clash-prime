@@ -179,6 +179,9 @@ impl PureClash {
                 self.peak_up_speed = 0;
                 // 换内核后重新自动检测一次出口信息。
                 self.net_check_auto_done = false;
+                // 旧内核会话的检测若还在路上，结果会被 generation 守卫
+                // 丢弃；这里同步复位，UI 不残留「检测中」。
+                self.net_check_loading = false;
                 self.spawn_readiness_probe(generation, cx);
             }
             Err(error) => {

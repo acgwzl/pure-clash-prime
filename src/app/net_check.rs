@@ -94,7 +94,9 @@ fn probe_site(port: u16, url: &str) -> Option<u64> {
         .timeout(std::time::Duration::from_secs(6))
         .build();
     let started = std::time::Instant::now();
-    match agent.get(url).call() {
+    // HEAD 而不是 GET：首页 HTML 动辄上百 KB，下载耗时会完全淹没
+    // 网络延迟；只取响应头，数字才是用户感知的「通不通、快不快」。
+    match agent.request("HEAD", url).call() {
         Ok(_) => Some(started.elapsed().as_millis() as u64),
         Err(ureq::Error::Status(_, _)) => Some(started.elapsed().as_millis() as u64),
         Err(_) => None,
@@ -139,14 +141,15 @@ fn probe(port: u16) -> anyhow::Result<NetReport> {
         .proxy(proxy)
         .timeout(NET_CHECK_TIMEOUT)
         .build();
+    // 计时到「响应头到达」为止：这是连接 + TLS + 请求的真实耗时。
+    // 若把 body 读取也算进去，数字会随接口返回体积波动，不再是网络延迟。
     let started = std::time::Instant::now();
-    let geo: GeoIp = agent
+    let response = agent
         .get(PUBLIC_IP_ENDPOINT)
         .call()
-        .map_err(|_| anyhow::anyhow!(t!("overview.network_unreachable").into_owned()))?
-        .into_json()
-        .context("出口 IP 查询响应格式无效")?;
+        .map_err(|_| anyhow::anyhow!(t!("overview.network_unreachable").into_owned()))?;
     let latency_ms = started.elapsed().as_millis() as u64;
+    let geo: GeoIp = response.into_json().context("出口 IP 查询响应格式无效")?;
 
     let location = match (geo.country.trim(), geo.city.trim()) {
         ("", "") => String::new(),
@@ -211,7 +214,10 @@ impl PureClash {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // 查询期间内核可能被停止或替换;丢弃属于旧启动代的结果。
+                // 但 loading 必须复位：守卫直接 return 会让按钮永久停在
+                // 「检测中」且被禁用，只能重启应用。
                 if generation != this.core_start_generation {
+                    this.net_check_loading = false;
                     return;
                 }
                 this.net_check_loading = false;
