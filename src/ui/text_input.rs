@@ -275,6 +275,14 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
+        // 拖选时鼠标会走出输入框：越过右边界直接选到末尾，
+        // 否则只能选到可见区域最后一个字符，看不到后面的内容。
+        if position.x >= bounds.right() {
+            return self.content.len();
+        }
+        if position.x <= bounds.left() {
+            return 0;
+        }
         // 内容已横向滚动 scroll_offset，点击换算必须补回来，否则点不到后半段。
         line.closest_index_for_x(position.x - bounds.left() + self.scroll_offset)
     }
