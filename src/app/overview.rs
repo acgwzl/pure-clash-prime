@@ -28,6 +28,7 @@ pub(super) fn render_overview(
         .child(top_row(app, palette, cx))
         .child(control_row(app, palette, cx))
         .child(info_row(app, palette, cx))
+        .child(sites_row(app, palette, cx))
         .child(bottom_row(app, palette, cx))
         .into_any_element()
 }
@@ -149,11 +150,16 @@ fn status_panel(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) 
                     active_profile_name(app),
                     palette,
                 ))
-                .child(meta_pair(
-                    tr("overview.active_node"),
-                    active_node_name(app),
-                    palette,
-                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .max_w(px(180.0))
+                        .child(meta_pair(
+                            tr("overview.active_node"),
+                            active_node_name(app),
+                            palette,
+                        )),
+                )
                 // 延迟常驻：判断线路质量最直观的数，放在大卡里一眼可见。
                 .child(meta_pair(
                     tr("overview.net_latency"),
@@ -467,6 +473,14 @@ fn toggle_knob(palette: Palette, on: bool, pending: bool) -> AnyElement {
 // ---------------------------------------------------------------- 第三行
 
 /// 第三行：网络、当前配置、服务状态、内存四张信息卡。
+/// 站点连通性行：五个常用站点横排一张卡，延迟按阈值着色。
+///
+/// 单独成块而不是塞进网络卡——用户需要一眼看到 GitHub/Google 通不通，
+/// 弹层看全量、这里看常用项。
+fn sites_row(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyElement {
+    crate::app::net_check::render_sites_row(app, palette, cx)
+}
+
 fn info_row(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyElement {
     div()
         .flex()
@@ -506,6 +520,32 @@ fn network_card(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) 
         .clone()
         .map(SharedString::from)
         .unwrap_or_else(|| SharedString::from("—"));
+    // 出口行：有结果时带国旗；检测中显示进行中。
+    let public = if app.net_check_loading {
+        tr("overview.network_checking").to_string()
+    } else {
+        match app.net_check_public.as_ref() {
+            Some(ip) => format!("{} {}", app.net_check_flag, ip)
+                .trim()
+                .to_owned(),
+            None => tr("overview.net_undetected").to_string(),
+        }
+    };
+    // 归属地 + 延迟：判断线路质量的两个常驻数。
+    let detail = app
+        .net_report
+        .as_ref()
+        .map(|report| {
+            let location = if report.location.is_empty() {
+                "—".to_owned()
+            } else {
+                report.location.clone()
+            };
+            // 不带「延迟」字样：标签行已经说了是归属地，值里再写一遍
+            // 只会把 4 位数延迟挤到截断。
+            format!("{} · {}ms", location, report.latency_ms)
+        })
+        .unwrap_or_else(|| tr("overview.net_undetected").to_string());
 
     info_card_shell(palette)
         .child(
@@ -533,25 +573,70 @@ fn network_card(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) 
                         .on_click(cx.listener(|this, _, _, cx| this.check_network(cx))),
                 ),
         )
+        // 紧凑三行：出口 / 归属地·延迟 / 内网。标签左、值右。
         .child(
             div()
-                .mt_auto()
-                .font_family("Bahnschrift")
-                // 内网地址最长 15 字符，四卡并排时 25px 会截断，降到 19px。
-                .text_size(px(19.0))
-                .font_semibold()
-                .tabnum()
-                .text_color(palette.text)
-                .truncate()
-                .child(local),
+                .mt_2()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .justify_around()
+                .child(net_compact_row(
+                    tr("overview.network_public_short"),
+                    SharedString::from(public),
+                    palette,
+                    true,
+                ))
+                .child(net_compact_row(
+                    tr("overview.net_location"),
+                    SharedString::from(detail),
+                    palette,
+                    false,
+                ))
+                .child(net_compact_row(
+                    tr("overview.network_local_short"),
+                    local,
+                    palette,
+                    false,
+                )),
         )
+}
+
+/// 网络卡的紧凑行：标签在左小字，值在右（主行更大更亮）。
+fn net_compact_row(
+    label: SharedString,
+    value: SharedString,
+    palette: Palette,
+    emphasis: bool,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
         .child(
             div()
-                .mt_1()
+                .flex_none()
                 .text_size(px(text_size::HINT))
                 .text_color(palette.faint)
-                .child(tr("overview.network_local")),
+                .child(label),
         )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family("Bahnschrift")
+                .tabnum()
+                .text_size(px(if emphasis { 15.0 } else { 12.0 }))
+                .text_color(if emphasis {
+                    palette.text
+                } else {
+                    palette.muted
+                })
+                .child(value),
+        )
+        .into_any_element()
 }
 
 fn profile_card(

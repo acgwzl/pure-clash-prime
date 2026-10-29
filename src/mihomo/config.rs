@@ -436,6 +436,24 @@ pub(crate) fn merge_runtime(profile_yaml: &str, baseline: &LocalBaseline) -> Res
     }
     let profile = parse_profile(profile_yaml)?;
     let mut mapping = profile;
+    // 附加规则前置到订阅规则之前：更具体的自定义规则要抢在订阅的
+    // 宽泛规则（尤其 MATCH 兜底）之前命中。启动流程已把 app.json 里
+    // 启用的规则同步进基线，这里负责真正写进内核配置。
+    if !baseline.extra_rules.is_empty() {
+        let extra: Vec<Value> = baseline
+            .extra_rules
+            .iter()
+            .filter(|rule| !rule.trim().is_empty())
+            .map(|rule| Value::from(rule.trim()))
+            .collect();
+        if !extra.is_empty() {
+            let mut rules = extra;
+            if let Some(existing) = mapping.get(Value::from("rules")).and_then(Value::as_sequence) {
+                rules.extend(existing.iter().cloned());
+            }
+            mapping.insert(Value::from("rules"), Value::Sequence(rules));
+        }
+    }
     baseline.insert_baseline_fields(&mut mapping);
     // 外部 UI 由订阅提供时可能指向任意目录，客户端不提供该能力，直接剔除。
     mapping.remove(Value::from("external-ui"));
@@ -628,7 +646,6 @@ mod tests {
             tun_enable: false,
             find_process_always: false,
             listeners: Vec::new(),
-            extra_rules: Vec::new(),
             extra_rules: Vec::new(),
         }
     }

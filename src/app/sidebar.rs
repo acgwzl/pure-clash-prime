@@ -28,42 +28,9 @@ pub(super) fn render_sidebar(
         .bg(palette.sidebar)
         .border_r_1()
         .border_color(palette.border)
-        .child(
-            // 品牌区：图形承载品牌色，字标靠字重区分层级。
-            // 品牌方块带一圈柔光——logo 是页面里唯一的「灯」，让它亮着。
-            div()
-                .px_4()
-                .pt_5()
-                .pb_4()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .size_7()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(palette.brand_soft)
-                        .shadow(kit::glow(palette, 14.0))
-                        .child(icon(ICON_APP, palette.brand, 16.0)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_baseline()
-                        .text_size(px(15.0))
-                        .text_color(palette.text)
-                        .child(div().font_medium().child("Pure"))
-                        .child(
-                            div()
-                                .font_semibold()
-                                .text_color(palette.brand)
-                                .child("Clash"),
-                        ),
-                ),
-        )
+        // 品牌区已移除：窗口标题栏本就带 Pure Clash 字样，再画一遍是重复。
+        // 菜单区留一段顶部呼吸，第一项不再贴着标题栏。
+        .child(div().h(px(10.0)))
         .child(
             div().px_2().flex().flex_col().gap_1().children(
                 Page::all()

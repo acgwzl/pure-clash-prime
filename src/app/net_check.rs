@@ -176,6 +176,12 @@ impl PureClash {
     /// 只由「检测」按钮触发:仓库口径是不隐式联网,Geo 数据都不自动下载,
     /// 每次进入概览页都请求第三方接口与之相悖。
     pub(super) fn check_network(&mut self, cx: &mut Context<Self>) {
+        self.check_network_ex(true, cx)
+    }
+
+    /// `open_dialog`：手动点「检测」时展开详情弹层；内核就绪后的自动检测
+    /// 传 false——换订阅重启内核也会触发自动检测，弹窗会反复打断使用。
+    pub(super) fn check_network_ex(&mut self, open_dialog: bool, cx: &mut Context<Self>) {
         if self.net_check_loading {
             return;
         }
@@ -184,8 +190,7 @@ impl PureClash {
         self.net_check_flag = String::new();
         self.public_isp = None;
         self.net_check_error = None;
-        // 点检测即把详情弹层打开，结果逐项填进去。
-        self.net_dialog_open = true;
+        self.net_dialog_open = open_dialog;
         let Some(mixed_port) = self
             .baseline
             .as_ref()
@@ -344,12 +349,7 @@ fn net_detail_text(app: &PureClash) -> SharedString {
     } else {
         report.location.clone()
     };
-    SharedString::from(format!(
-        "{} · {} {} ms",
-        location,
-        tr("overview.net_latency"),
-        report.latency_ms
-    ))
+    SharedString::from(format!("{} · {}ms", location, report.latency_ms))
 }
 
 /// 卡片内一行：左标签右值。`emphasis` 为真时值更大更亮（用于主 IP）。
@@ -668,4 +668,88 @@ fn latency_color(ms: u64, palette: Palette) -> gpui::Rgba {
     } else {
         palette.danger
     }
+}
+
+/// 概览页的站点连通性卡片：五个站点横排，各自显示延迟。
+///
+/// 没有检测结果时显示「未检测」占位，保持布局稳定；
+/// 检测中逐项变亮，完成后按阈值着色。
+pub(super) fn render_sites_row(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let report = app.net_report.as_ref();
+
+    let mut cells: Vec<AnyElement> = Vec::new();
+    for (index, (name, _)) in SITE_TARGETS.iter().enumerate() {
+        let result = report.and_then(|report| report.sites.get(index));
+        let (text, color, dot) = match result {
+            Some((_, Some(ms))) => (
+                format!("{ms} ms"),
+                latency_color(*ms, palette),
+                palette.success,
+            ),
+            Some((_, None)) => (
+                tr("overview.net_timeout").to_string(),
+                palette.danger,
+                palette.danger,
+            ),
+            None if app.net_check_loading => (
+                tr("overview.net_checking").to_string(),
+                palette.muted,
+                palette.muted,
+            ),
+            None => (
+                tr("overview.net_undetected").to_string(),
+                palette.faint,
+                palette.faint,
+            ),
+        };
+        cells.push(
+            div()
+                .flex_1()
+                .min_w_0()
+                .px(px(14.0))
+                .py(px(10.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(div().size(px(6.0)).rounded_full().bg(dot))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(text_size::ROW))
+                                .text_color(palette.text)
+                                .child(SharedString::from((*name).to_owned())),
+                        ),
+                )
+                .child(
+                    div()
+                        .font_family("Bahnschrift")
+                        .tabnum()
+                        .text_size(px(text_size::META))
+                        .text_color(color)
+                        .child(SharedString::from(text)),
+                )
+                .into_any_element(),
+        );
+        if index + 1 < SITE_TARGETS.len() {
+            cells.push(div().w(px(1.0)).bg(palette.border).into_any_element());
+        }
+    }
+
+    kit::card(palette)
+        .flex_none()
+        .p(px(6.0))
+        .flex()
+        .items_center()
+        .children(cells)
+        .into_any_element()
 }

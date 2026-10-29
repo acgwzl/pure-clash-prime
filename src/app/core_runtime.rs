@@ -345,7 +345,8 @@ impl PureClash {
                         // 省得用户每次开机都手动点「检测」。
                         if !this.net_check_auto_done && !this.net_check_loading {
                             this.net_check_auto_done = true;
-                            this.check_network(cx);
+                            // 自动检测静默进行：结果直接更新到主页连通性区域，不弹窗打断。
+                            this.check_network_ex(false, cx);
                         }
                         if this.runtime_state_failing {
                             this.runtime_state_failing = false;

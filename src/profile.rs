@@ -384,6 +384,7 @@ mod tests {
             last_auto_attempt_at: last_attempt,
             usage: None,
             usage_checked_at: 0,
+            user_agent: None,
         }
     }
 
@@ -393,13 +394,13 @@ mod tests {
         let original = meta.clone();
         // 只改间隔或链接首尾空白，不下载，也不伪造内容更新时间。
         assert!(
-            !edit_subscription_metadata(&mut meta, " https://example.com/sub ", "120", 10_000)
+            !edit_subscription_metadata(&mut meta, " https://example.com/sub ", "120", "", 10_000)
                 .unwrap()
         );
         assert_eq!(meta.update_interval_minutes, 120);
         assert_eq!(meta.updated_at, original.updated_at);
         assert!(
-            edit_subscription_metadata(&mut meta, "https://example.com/new", "0", 10_000).unwrap()
+            edit_subscription_metadata(&mut meta, "https://example.com/new", "0", "", 10_000).unwrap()
         );
         assert_eq!(meta.url.as_deref(), Some("https://example.com/new"));
         assert_eq!(meta.id, original.id);
@@ -420,13 +421,13 @@ mod tests {
             ("", "0"),
             ("https://example.com/new", "-1"),
         ] {
-            assert!(edit_subscription_metadata(&mut meta, url, interval, 10_000).is_err());
+            assert!(edit_subscription_metadata(&mut meta, url, interval, "", 10_000).is_err());
             assert_eq!(meta, original);
         }
         meta.url = None;
         let local = meta.clone();
         assert!(
-            edit_subscription_metadata(&mut meta, "https://example.com/new", "60", 10_000).is_err()
+            edit_subscription_metadata(&mut meta, "https://example.com/new", "60", "", 10_000).is_err()
         );
         assert_eq!(meta, local);
     }
@@ -435,7 +436,7 @@ mod tests {
     fn enabling_interval_on_never_updated_subscription_starts_from_save_time() {
         let mut meta = due_meta(0, 0, 0);
         assert!(
-            !edit_subscription_metadata(&mut meta, "https://example.com/sub", "60", 10_000)
+            !edit_subscription_metadata(&mut meta, "https://example.com/sub", "60", "", 10_000)
                 .unwrap()
         );
         assert_eq!(meta.updated_at, 0);
@@ -497,6 +498,7 @@ mod tests {
             &mut config.profiles[0],
             "https://example.com/new",
             "120",
+            "",
             10_000,
         )
         .unwrap();
@@ -643,10 +645,12 @@ mod tests {
         let baseline = LocalBaseline {
             mode: crate::mihomo::controller::Mode::Rule,
             mixed_port: 17890,
+            subscription_direct_port: 17891,
             controller_addr: "127.0.0.1:19098".to_owned(),
             secret: "activate-secret".to_owned(),
             tun_enable: false,
             find_process_always: false,
+            listeners: Vec::new(),
             extra_rules: Vec::new(),
         };
         let profile_yaml = "\
@@ -727,7 +731,7 @@ rules:
         let version = env!("PURE_CLASH_DEFAULT_MIHOMO_VERSION");
 
         // 1. 下载真实订阅并走完整校验管线。
-        let content = download_subscription_with_usage(&subscription_url)
+        let content = download_subscription_with_usage(&subscription_url, None)
             .expect("应下载订阅")
             .0;
         let id = new_profile_id();
