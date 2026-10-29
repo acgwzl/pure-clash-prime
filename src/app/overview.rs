@@ -153,6 +153,12 @@ fn status_panel(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) 
                     tr("overview.active_node"),
                     active_node_name(app),
                     palette,
+                ))
+                // 延迟常驻：判断线路质量最直观的数，放在大卡里一眼可见。
+                .child(meta_pair(
+                    tr("overview.net_latency"),
+                    latency_text(app),
+                    palette,
                 )),
         )
 }
@@ -465,7 +471,8 @@ fn info_row(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> A
     div()
         .flex()
         .gap_4()
-        .h(px(128.0))
+        // 网络卡是三行紧凑布局，128px 会把最后一行裁掉。
+        .h(px(150.0))
         .flex_none()
         .child(network_card(app, palette, cx).flex_1().min_w_0())
         .child(div().flex_1().min_w_0().child(profile_card(app, palette, cx)))
@@ -1016,6 +1023,14 @@ fn group_row(group: &crate::mihomo::controller::GroupSnapshot, palette: Palette)
 }
 
 // ---------------------------------------------------------------- 工具
+
+/// 最近一次检测的出口延迟；没测过时给占位符，保证布局稳定。
+fn latency_text(app: &PureClash) -> SharedString {
+    app.net_report
+        .as_ref()
+        .map(|report| SharedString::from(format!("{} ms", report.latency_ms)))
+        .unwrap_or_else(|| tr("overview.net_undetected"))
+}
 
 /// 承载流量的策略组：优先按已知命名找，找不到时退到第一个可手动选择的组。
 fn active_group(app: &PureClash) -> Option<&crate::mihomo::controller::GroupSnapshot> {

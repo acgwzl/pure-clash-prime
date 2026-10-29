@@ -8,7 +8,8 @@ use gpui::{AnyElement, SharedString, Styled, div, px};
 use serde::Deserialize;
 
 use super::*;
-use crate::theme::{FontWeightExt, Palette, TabularNums};
+use crate::assets::ICON_WINDOW_CLOSE;
+use crate::theme::{FontWeightExt, Palette, TabularNums, text_size};
 use crate::ui::kit;
 
 /// 出口 IP 查询端点;返回 `ip` 与 `country_code`。
@@ -29,6 +30,35 @@ struct GeoIp {
     organization: String,
     #[serde(default)]
     isp: String,
+    /// 国家名（英文），用于展示归属地。
+    #[serde(default)]
+    country: String,
+    /// 城市名；部分地区接口不给。
+    #[serde(default)]
+    city: String,
+}
+
+/// 站点连通性探测目标；按常用程度排序。
+const SITE_TARGETS: [(&str, &str); 5] = [
+    ("GitHub", "https://github.com"),
+    ("Google", "https://www.google.com/generate_204"),
+    ("YouTube", "https://www.youtube.com"),
+    ("Cloudflare", "http://cp.cloudflare.com/generate_204"),
+    ("Telegram", "https://telegram.org"),
+];
+
+/// 一次网络检测的完整结果。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NetReport {
+    pub(crate) ip: String,
+    pub(crate) flag: String,
+    /// 「日本 · Tokyo」形式；国家或城市缺失时只显示其一。
+    pub(crate) location: String,
+    pub(crate) isp: String,
+    /// 出口查询往返耗时（毫秒），代表当前链路质量。
+    pub(crate) latency_ms: u64,
+    /// 各站点的延迟；None 表示不通。
+    pub(crate) sites: Vec<(String, Option<u64>)>,
 }
 
 /// 取本机默认路由出口地址:UDP 连接不实际发包,只让内核选出一条路由,
@@ -53,29 +83,91 @@ pub(super) fn flag_of(country_code: &str) -> String {
         .collect()
 }
 
-/// 经 mixed-port 出站查询出口 IP。
+/// 探测单个站点是否可达，返回往返毫秒。
 ///
-/// 走内核而不是直连:直连拿到的是本机真实地址,与「当前出口」的语义不符;
-/// 内核未运行时宁可报错,也不静默给出误导性的结果。
-fn lookup_public(mixed_port: u16) -> anyhow::Result<(String, String, String)> {
-    let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{mixed_port}"))
+/// 拿到任何 HTTP 状态码都算「通」：不少站点对探测请求回 403/404，
+/// 那只能说明网络到得了，不是链路故障。
+fn probe_site(port: u16, url: &str) -> Option<u64> {
+    let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{port}")).ok()?;
+    let agent = ureq::AgentBuilder::new()
+        .proxy(proxy)
+        .timeout(std::time::Duration::from_secs(6))
+        .build();
+    let started = std::time::Instant::now();
+    match agent.get(url).call() {
+        Ok(_) => Some(started.elapsed().as_millis() as u64),
+        Err(ureq::Error::Status(_, _)) => Some(started.elapsed().as_millis() as u64),
+        Err(_) => None,
+    }
+}
+
+/// 并发探测全部站点：串行时最坏情况要等 5 个超时，弹层会长时间空白。
+fn probe_sites(port: u16) -> Vec<(String, Option<u64>)> {
+    let mut results: Vec<(String, Option<u64>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = SITE_TARGETS
+            .iter()
+            .map(|(name, url)| {
+                scope.spawn(move || {
+                    let latency = probe_site(port, url);
+                    ((*name).to_owned(), latency)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
+    // 并发回来是无序的，按 SITE_TARGETS 的声明顺序还原。
+    results.sort_by_key(|(name, _)| {
+        SITE_TARGETS
+            .iter()
+            .position(|(target, _)| target == name)
+            .unwrap_or(usize::MAX)
+    });
+    results
+}
+
+/// 经 mixed-port 出站做一次完整检测：出口信息 + 延迟 + 各站点连通性。
+///
+/// 走内核而不是直连：直连拿到的是本机真实地址，与「当前出口」的语义不符；
+/// 内核未运行时宁可报错，也不静默给出误导性的结果。
+fn probe(port: u16) -> anyhow::Result<NetReport> {
+    let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{port}"))
         .map_err(|_| anyhow::anyhow!(t!("overview.network_proxy_invalid").into_owned()))?;
     let agent = ureq::AgentBuilder::new()
         .proxy(proxy)
         .timeout(NET_CHECK_TIMEOUT)
         .build();
+    let started = std::time::Instant::now();
     let geo: GeoIp = agent
         .get(PUBLIC_IP_ENDPOINT)
         .call()
         .map_err(|_| anyhow::anyhow!(t!("overview.network_unreachable").into_owned()))?
         .into_json()
         .context("出口 IP 查询响应格式无效")?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let location = match (geo.country.trim(), geo.city.trim()) {
+        ("", "") => String::new(),
+        (country, "") => country.to_owned(),
+        ("", city) => city.to_owned(),
+        (country, city) => format!("{country} · {city}"),
+    };
     let isp = if geo.organization.is_empty() {
         geo.isp
     } else {
         geo.organization
     };
-    Ok((geo.ip, geo.country_code, isp))
+
+    Ok(NetReport {
+        flag: flag_of(&geo.country_code),
+        ip: geo.ip,
+        location,
+        isp,
+        latency_ms,
+        sites: probe_sites(port),
+    })
 }
 
 impl PureClash {
@@ -92,6 +184,8 @@ impl PureClash {
         self.net_check_flag = String::new();
         self.public_isp = None;
         self.net_check_error = None;
+        // 点检测即把详情弹层打开，结果逐项填进去。
+        self.net_dialog_open = true;
         let Some(mixed_port) = self
             .baseline
             .as_ref()
@@ -108,7 +202,7 @@ impl PureClash {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { lookup_public(mixed_port) })
+                .spawn(async move { probe(mixed_port) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 // 查询期间内核可能被停止或替换;丢弃属于旧启动代的结果。
@@ -117,10 +211,15 @@ impl PureClash {
                 }
                 this.net_check_loading = false;
                 match result {
-                    Ok((ip, country_code, isp)) => {
-                        this.net_check_flag = flag_of(&country_code);
-                        this.net_check_public = Some(ip);
-                        this.public_isp = if isp.is_empty() { None } else { Some(isp) };
+                    Ok(report) => {
+                        this.net_check_flag = report.flag.clone();
+                        this.net_check_public = Some(report.ip.clone());
+                        this.public_isp = if report.isp.is_empty() {
+                            None
+                        } else {
+                            Some(report.isp.clone())
+                        };
+                        this.net_report = Some(report);
                     }
                     Err(error) => {
                         this.net_check_error = Some(concise_error(&format!("{error:#}"), 120));
@@ -130,6 +229,12 @@ impl PureClash {
             });
         })
         .detach();
+    }
+
+    /// 关闭网络详情弹层。
+    pub(super) fn close_net_dialog(&mut self, cx: &mut Context<Self>) {
+        self.net_dialog_open = false;
+        cx.notify();
     }
 }
 
@@ -184,15 +289,35 @@ pub(super) fn render_network_card(
                 )),
         )
         .child(
+            // 紧凑三行：标签在左、值在右。原先两块上下堆叠的写法会把
+            // 归属地与延迟挤出卡片（128px 放不下四行）。
             div()
                 .mt_3()
                 .flex_1()
+                .min_h_0()
                 .flex()
                 .flex_col()
                 .justify_around()
-                .gap_2()
-                .child(ip_block(tr("overview.network_public"), public, palette))
-                .child(ip_block(tr("overview.network_local"), local, palette)),
+                .gap_1()
+                .child(compact_row(
+                    tr("overview.network_public_short"),
+                    public,
+                    palette,
+                    true,
+                ))
+                // 归属地 + 延迟常驻：这是判断线路质量最常用的两个数。
+                .child(compact_row(
+                    tr("overview.net_location"),
+                    net_detail_text(app),
+                    palette,
+                    false,
+                ))
+                .child(compact_row(
+                    tr("overview.network_local_short"),
+                    local,
+                    palette,
+                    false,
+                )),
         )
         .when_some(app.net_check_error.clone(), |card, error| {
             card.child(
@@ -206,6 +331,59 @@ pub(super) fn render_network_card(
                     .child(SharedString::from(error)),
             )
         })
+        .into_any_element()
+}
+
+/// 归属地 + 延迟的组合文案；没有检测结果时显示占位。
+fn net_detail_text(app: &PureClash) -> SharedString {
+    let Some(report) = app.net_report.as_ref() else {
+        return tr("overview.network_undetected");
+    };
+    let location = if report.location.is_empty() {
+        "—".to_owned()
+    } else {
+        report.location.clone()
+    };
+    SharedString::from(format!(
+        "{} · {} {} ms",
+        location,
+        tr("overview.net_latency"),
+        report.latency_ms
+    ))
+}
+
+/// 卡片内一行：左标签右值。`emphasis` 为真时值更大更亮（用于主 IP）。
+fn compact_row(
+    label: SharedString,
+    value: SharedString,
+    palette: Palette,
+    emphasis: bool,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(text_size::HINT))
+                .text_color(palette.faint)
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .tabnum()
+                .text_size(px(if emphasis { 15.0 } else { 12.0 }))
+                .text_color(if emphasis {
+                    palette.text
+                } else {
+                    palette.muted
+                })
+                .child(value),
+        )
         .into_any_element()
 }
 
@@ -279,5 +457,215 @@ mod tests {
             value.parse::<std::net::IpAddr>().is_ok(),
             "取到的应是可解析的 IP:{value}"
         );
+    }
+}
+
+/// 网络详情弹层：出口信息（归属地/运营商/延迟）+ 各站点连通性。
+///
+/// 统一放在这里，避免把这些信息摊到四张信息卡里挤成一团。
+pub(super) fn render_net_dialog(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    let report = app.net_report.clone();
+    let local = app
+        .net_check_local
+        .clone()
+        .unwrap_or_else(|| "—".to_owned());
+
+    let mut rows: Vec<AnyElement> = Vec::new();
+    if let Some(report) = report.as_ref() {
+        let ip_line = if report.flag.is_empty() {
+            report.ip.clone()
+        } else {
+            format!("{} {}", report.flag, report.ip)
+        };
+        rows.push(detail_row(tr("overview.network_public"), ip_line, palette));
+        rows.push(detail_row(
+            tr("overview.net_location"),
+            if report.location.is_empty() {
+                "—".to_owned()
+            } else {
+                report.location.clone()
+            },
+            palette,
+        ));
+        rows.push(detail_row(
+            tr("overview.net_isp"),
+            if report.isp.is_empty() {
+                "—".to_owned()
+            } else {
+                report.isp.clone()
+            },
+            palette,
+        ));
+        rows.push(detail_row(
+            tr("overview.net_latency"),
+            format!("{} ms", report.latency_ms),
+            palette,
+        ));
+        rows.push(detail_row(tr("overview.network_local"), local, palette));
+    }
+
+    let site_rows: Vec<AnyElement> = report
+        .as_ref()
+        .map(|report| {
+            report
+                .sites
+                .iter()
+                .map(|(name, latency)| {
+                    let (text, color) = match latency {
+                        Some(ms) => (format!("{ms} ms"), latency_color(*ms, palette)),
+                        None => (tr("overview.net_timeout").to_string(), palette.danger),
+                    };
+                    div()
+                        .py(px(6.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(text_size::ROW))
+                                .text_color(palette.text)
+                                .child(SharedString::from(name.clone())),
+                        )
+                        .child(
+                            div()
+                                .font_family("Bahnschrift")
+                                .tabnum()
+                                .text_size(px(text_size::META))
+                                .text_color(color)
+                                .child(SharedString::from(text)),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    div()
+        .id("net-dialog-scrim")
+        .absolute()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x00000099))
+        .on_click(cx.listener(|this, _, _, cx| this.close_net_dialog(cx)))
+        .child(
+            div()
+                .id("net-dialog-panel")
+                .w(px(420.0))
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .bg(palette.surface_high)
+                .border_1()
+                .border_color(palette.border)
+                .shadow_lg()
+                .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(palette.border)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(text_size::BODY))
+                                .font_semibold()
+                                .text_color(palette.text)
+                                .child(tr("overview.net_detail_title")),
+                        )
+                        .child(
+                            div()
+                                .id("net-dialog-close")
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.7))
+                                .child(icon(ICON_WINDOW_CLOSE, palette.muted, 14.0))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_net_dialog(cx))),
+                        ),
+                )
+                .when(app.net_check_loading, |panel| {
+                    panel.child(
+                        div()
+                            .p_4()
+                            .text_size(px(text_size::META))
+                            .text_color(palette.muted)
+                            .child(tr("overview.net_checking")),
+                    )
+                })
+                .children(rows)
+                .when_some(app.net_check_error.clone(), |panel, error| {
+                    panel.child(
+                        div()
+                            .mx_4()
+                            .mb_3()
+                            .p_2()
+                            .rounded_md()
+                            .bg(palette.danger_soft)
+                            .text_size(px(text_size::HINT))
+                            .text_color(palette.danger)
+                            .child(SharedString::from(error)),
+                    )
+                })
+                .when(!site_rows.is_empty(), |panel| {
+                    panel
+                        .child(
+                            div()
+                                .px_4()
+                                .pt_3()
+                                .pb_1()
+                                .text_size(px(text_size::HINT))
+                                .text_color(palette.faint)
+                                .child(tr("overview.net_sites")),
+                        )
+                        .child(div().px_4().pb_3().flex().flex_col().children(site_rows))
+                }),
+        )
+        .into_any_element()
+}
+
+/// 详情里的一行：左标签右值。
+fn detail_row(label: SharedString, value: String, palette: Palette) -> AnyElement {
+    div()
+        .px_4()
+        .py(px(5.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(text_size::HINT))
+                .text_color(palette.faint)
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family("Bahnschrift")
+                .tabnum()
+                .text_size(px(text_size::ROW))
+                .text_color(palette.text)
+                .child(SharedString::from(value)),
+        )
+        .into_any_element()
+}
+
+/// 延迟着色：200ms 内算好，800ms 内一般，再慢标红。
+fn latency_color(ms: u64, palette: Palette) -> gpui::Rgba {
+    if ms <= 200 {
+        palette.success
+    } else if ms <= 800 {
+        palette.amber
+    } else {
+        palette.danger
     }
 }

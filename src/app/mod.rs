@@ -419,6 +419,10 @@ pub(crate) struct PureClash {
     net_check_error: Option<String>,
     /// 本次内核会话是否已自动跑过网络检测；换内核后归零。
     net_check_auto_done: bool,
+    /// 最近一次网络检测的完整结果；None 表示还没测过。
+    net_report: Option<crate::app::net_check::NetReport>,
+    /// 网络详情弹层是否展开。
+    net_dialog_open: bool,
     /// 关于页检查更新是否进行中。
     update_checking: bool,
     /// 检查发现新版本时置位；界面用它强调更新提示。
@@ -647,6 +651,8 @@ impl PureClash {
             net_check_loading: false,
             net_check_error: None,
             net_check_auto_done: false,
+            net_report: None,
+            net_dialog_open: false,
             update_checking: false,
             update_available: false,
             update_status: None,
@@ -703,6 +709,9 @@ impl Render for PureClash {
             // 订阅编辑弹窗同样挂在页面容器之外，两种视图共用。
             .when(self.editing_profile_index.is_some(), |root| {
                 root.child(render_profile_editor_overlay(self, palette, cx))
+            })
+            .when(self.net_dialog_open, |root| {
+                root.child(net_check::render_net_dialog(self, palette, cx))
             });
 
         #[cfg(target_os = "linux")]
