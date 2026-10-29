@@ -959,16 +959,50 @@ impl PureClash {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            // 阶段一：并发下载。订阅站点的响应速度差异极大，串行时一个慢站
+            // 会把整批拖到超时；下载是纯 IO，并发不会互相干扰。
+            let (tx, rx) = async_channel::bounded(total);
+            for (index, url, id, user_agent) in targets {
+                let tx = tx.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let result = (|| -> anyhow::Result<(usize, String, String)> {
+                            let content =
+                                profile::download_subscription_with_usage(&url, user_agent.as_deref())?
+                                    .0;
+                            Ok((index, id, content))
+                        })();
+                        let _ = tx.send(result).await;
+                    })
+                    .detach();
+            }
+            drop(tx);
+
+            let mut downloaded: Vec<(usize, String, String)> = Vec::new();
+            while let Ok(result) = rx.recv().await {
+                match result {
+                    Ok(item) => downloaded.push(item),
+                    Err(error) => {
+                        log_warn!("profile", "批量更新下载失败：{error:#}");
+                    }
+                }
+            }
+
+            // 阶段二：串行校验落盘。`-t` 校验与原子写是重活，串行避免同时
+            // 拉起多个内核进程；到这里已经没有网络等待，速度由本地决定。
             let mut ok = 0usize;
             let mut failed = 0usize;
             let mut active_runtime: Option<(String, String)> = None;
+            let downloaded_total = downloaded.len();
+            let download_failed = total.saturating_sub(downloaded_total);
+            failed += download_failed;
 
-            for (step, (index, url, id, user_agent)) in targets.into_iter().enumerate() {
+            for (step, (index, id, content)) in downloaded.into_iter().enumerate() {
                 let _ = this.update(cx, |this, cx| {
                     this.profile_busy = Some(
                         t!(
                             "profiles.busy_updating_all",
-                            done = (step + 1).to_string(),
+                            done = (step + 1 + download_failed).to_string(),
                             total = total.to_string()
                         )
                         .into_owned(),
@@ -978,24 +1012,11 @@ impl PureClash {
 
                 let paths_inner = paths.clone();
                 let version_inner = version.clone();
-                let url_inner = url.clone();
                 let id_inner = id.clone();
-                let ua_inner = user_agent.clone();
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let content = profile::download_subscription_with_usage(
-                            &url_inner,
-                            ua_inner.as_deref(),
-                        )?.0;
-                        let runtime = profile::validate_and_store(
-                            &paths_inner,
-                            &version_inner,
-                            &id_inner,
-                            &content,
-                            convert,
-                        )?;
-                        Ok::<_, anyhow::Error>(runtime)
+                        profile::validate_and_store(&paths_inner, &version_inner, &id_inner, &content, convert)
                     })
                     .await;
 
@@ -1013,11 +1034,7 @@ impl PureClash {
                     }
                     Err(error) => {
                         failed += 1;
-                        log_warn!(
-                            "profile",
-                            "批量更新失败（{}）：{error:#}",
-                            host_of_url(&url)
-                        );
+                        log_warn!("profile", "批量更新落盘失败：{error:#}");
                     }
                 }
             }

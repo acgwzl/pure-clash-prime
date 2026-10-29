@@ -12,7 +12,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
     Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle,
     Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
 };
 
@@ -76,6 +77,9 @@ pub(crate) struct TextInput {
     /// 锁定版本的 GPUI 没有内置滚动，TextElement 全程从容器左边缘绘制，
     /// 长文本会直接画到容器外；这里记录偏移并在绘制时左移。
     scroll_offset: Pixels,
+    /// 用户用滚轮手动滚动过；此时不再让光标位置自动覆盖滚动位置，
+    /// 直到下一次光标移动。
+    manual_scroll: bool,
 }
 
 impl TextInput {
@@ -90,6 +94,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             scroll_offset: px(0.),
+            manual_scroll: false,
             is_selecting: false,
         }
     }
@@ -180,6 +185,28 @@ impl TextInput {
         self.is_selecting = false;
     }
 
+    /// 滚轮横向滚动：单行输入没有原生滚动，长文本只能靠它看到尾部。
+    /// 纵向滚轮也映射成横向，触控板双指横滑同样生效。
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (dx, dy) = match event.delta {
+            ScrollDelta::Pixels(p) => (p.x, p.y),
+            ScrollDelta::Lines(l) => (px(l.x * 40.), px(l.y * 40.)),
+        };
+        let delta = if dx.abs() > px(0.5) { dx } else { dy };
+        if delta.abs() < px(0.5) {
+            return;
+        }
+        self.manual_scroll = true;
+        self.scroll_offset = (self.scroll_offset - delta).max(px(0.));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -219,6 +246,8 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        // 光标一动就恢复「跟随光标」的自动滚动。
+        self.manual_scroll = false;
         self.selected_range = offset..offset;
         cx.notify()
     }
@@ -555,11 +584,14 @@ impl Element for TextElement {
         // 留 8px 余量，避免光标正好贴在边框上。
         let visible_width = bounds.size.width;
         let mut scroll = self.input.read(cx).scroll_offset;
-        if cursor_pos - scroll > visible_width - px(8.) {
-            scroll = cursor_pos - visible_width + px(8.);
-        }
-        if cursor_pos - scroll < px(0.) {
-            scroll = cursor_pos;
+        // 用户手动滚动过就先保留他的位置，光标移动时再恢复跟随。
+        if !self.input.read(cx).manual_scroll {
+            if cursor_pos - scroll > visible_width - px(8.) {
+                scroll = cursor_pos - visible_width + px(8.);
+            }
+            if cursor_pos - scroll < px(0.) {
+                scroll = cursor_pos;
+            }
         }
         let scroll = scroll.max(px(0.));
         self.input.update(cx, |input, _| input.scroll_offset = scroll);
@@ -670,6 +702,7 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .line_height(px(20.))
             .text_size(px(13.))
             .child(TextElement { input: cx.entity() })
