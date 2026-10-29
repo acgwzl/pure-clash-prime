@@ -71,6 +71,11 @@ pub(crate) struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// 单行文本的水平滚动偏移；内容超过宽度时跟随光标移动。
+    ///
+    /// 锁定版本的 GPUI 没有内置滚动，TextElement 全程从容器左边缘绘制，
+    /// 长文本会直接画到容器外；这里记录偏移并在绘制时左移。
+    scroll_offset: Pixels,
 }
 
 impl TextInput {
@@ -84,6 +89,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_offset: px(0.),
             is_selecting: false,
         }
     }
@@ -240,7 +246,8 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        // 内容已横向滚动 scroll_offset，点击换算必须补回来，否则点不到后半段。
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_offset)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -543,12 +550,26 @@ impl Element for TextElement {
             .shape_line(display_text, font_size, &runs, None);
 
         let cursor_pos = line.x_for_index(cursor);
+
+        // 水平滚动：光标逼近右边界时把内容左移，回到左边界外时归零。
+        // 留 8px 余量，避免光标正好贴在边框上。
+        let visible_width = bounds.size.width;
+        let mut scroll = self.input.read(cx).scroll_offset;
+        if cursor_pos - scroll > visible_width - px(8.) {
+            scroll = cursor_pos - visible_width + px(8.);
+        }
+        if cursor_pos - scroll < px(0.) {
+            scroll = cursor_pos;
+        }
+        let scroll = scroll.max(px(0.));
+        self.input.update(cx, |input, _| input.scroll_offset = scroll);
+
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
+                        point(bounds.left() + cursor_pos - scroll, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
                     gpui::blue(),
@@ -559,11 +580,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.left() + line.x_for_index(selected_range.start) - scroll,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.left() + line.x_for_index(selected_range.end) - scroll,
                             bounds.bottom(),
                         ),
                     ),
@@ -599,8 +620,9 @@ impl Element for TextElement {
             window.paint_quad(selection)
         }
         let line = prepaint.line.take().unwrap();
+        let scroll = self.input.read(cx).scroll_offset;
         line.paint(
-            bounds.origin,
+            point(bounds.left() - scroll, bounds.top()),
             window.line_height(),
             gpui::TextAlign::Left,
             None,
