@@ -125,8 +125,9 @@ impl PureClash {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // 新增订阅走默认 UA；需要覆盖时可在编辑弹窗里补。
                     let content =
-                        profile::download_subscription_with_usage(&url_inner)?.0;
+                        profile::download_subscription_with_usage(&url_inner, None)?.0;
                     let id = profile::new_profile_id();
                     let runtime = profile::validate_and_store(&paths, &version, &id, &content, convert)?;
                     Ok::<_, anyhow::Error>((id, runtime))
@@ -289,6 +290,7 @@ impl PureClash {
         let Some(url) = meta.url.clone() else {
             return;
         };
+        let user_agent = meta.user_agent.clone();
         let version = self.config.mihomo_version.clone();
         let paths = self.paths.clone();
         let id = meta.id.clone();
@@ -304,7 +306,8 @@ impl PureClash {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let content = profile::download_subscription_with_usage(&url)?.0;
+                    let content =
+                        profile::download_subscription_with_usage(&url, user_agent.as_deref())?.0;
                     let runtime =
                         profile::validate_and_store(&paths, &version, &id_inner, &content, convert)?;
                     Ok::<_, anyhow::Error>(runtime)
@@ -407,6 +410,7 @@ impl PureClash {
             return;
         };
         let id = meta.id.clone();
+        let user_agent = meta.user_agent.clone();
         self.auto_update_in_flight = Some(id.clone());
         let version = self.config.mihomo_version.clone();
         let paths = self.paths.clone();
@@ -423,7 +427,8 @@ impl PureClash {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let content = profile::download_subscription_with_usage(&url)?.0;
+                    let content =
+                        profile::download_subscription_with_usage(&url, user_agent.as_deref())?.0;
                     let profile_path = profile::profile_yaml_path(&paths, &id_inner);
                     // 与磁盘上的现有内容直接比对（本地比较，语义等同哈希且
                     // 无碰撞）：一致则磁盘内容已通过校验，跳过落盘与 -t 终审。
@@ -596,6 +601,9 @@ impl PureClash {
         };
         self.profile_edit_url
             .update(cx, |input, cx| input.set_content(url, cx));
+        let ua = meta.user_agent.clone().unwrap_or_default();
+        self.profile_edit_user_agent
+            .update(cx, |input, cx| input.set_content(ua, cx));
         self.profile_form_interval
             .update(cx, |input, cx| input.set_content(initial, cx));
         self.profile_error = None;
@@ -618,6 +626,7 @@ impl PureClash {
             meta,
             self.profile_edit_url.read(cx).content(),
             self.profile_form_interval.read(cx).content(),
+            self.profile_edit_user_agent.read(cx).content(),
             profile::now_secs(),
         );
         let url_changed = match result {
@@ -652,6 +661,8 @@ impl PureClash {
     pub(super) fn cancel_profile_edit(&mut self, cx: &mut Context<Self>) {
         if self.editing_profile_index.take().is_some() {
             self.profile_edit_url
+                .update(cx, |input, cx| input.set_content(String::new(), cx));
+            self.profile_edit_user_agent
                 .update(cx, |input, cx| input.set_content(String::new(), cx));
             self.profile_error = None;
             cx.notify();
@@ -918,11 +929,15 @@ impl PureClash {
         if self.profile_actions_locked() {
             return;
         }
-        let targets: Vec<(usize, String, String)> = self
+        let targets: Vec<(usize, String, String, Option<String>)> = self
             .profiles
             .iter()
             .enumerate()
-            .filter_map(|(index, meta)| meta.url.clone().map(|url| (index, url, meta.id.clone())))
+            .filter_map(|(index, meta)| {
+                meta.url
+                    .clone()
+                    .map(|url| (index, url, meta.id.clone(), meta.user_agent.clone()))
+            })
             .collect();
         if targets.is_empty() {
             return;
@@ -948,7 +963,7 @@ impl PureClash {
             let mut failed = 0usize;
             let mut active_runtime: Option<(String, String)> = None;
 
-            for (step, (index, url, id)) in targets.into_iter().enumerate() {
+            for (step, (index, url, id, user_agent)) in targets.into_iter().enumerate() {
                 let _ = this.update(cx, |this, cx| {
                     this.profile_busy = Some(
                         t!(
@@ -965,10 +980,14 @@ impl PureClash {
                 let version_inner = version.clone();
                 let url_inner = url.clone();
                 let id_inner = id.clone();
+                let ua_inner = user_agent.clone();
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        let content = profile::download_subscription_with_usage(&url_inner)?.0;
+                        let content = profile::download_subscription_with_usage(
+                            &url_inner,
+                            ua_inner.as_deref(),
+                        )?.0;
                         let runtime = profile::validate_and_store(
                             &paths_inner,
                             &version_inner,

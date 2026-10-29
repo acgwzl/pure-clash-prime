@@ -379,6 +379,8 @@ pub(crate) struct PureClash {
     /// 正在自动更新的配置 id；与手动操作（profile_busy）互斥。
     /// 自动更新静默执行，不占用 profile_busy 以免打扰界面。
     auto_update_in_flight: Option<String>,
+    /// 编辑弹窗里的自定义 User-Agent 输入框。
+    profile_edit_user_agent: Entity<TextInput>,
     /// 行内编辑链接与更新间隔的配置下标；None 表示未在编辑。
     editing_profile_index: Option<usize>,
     /// 右键打开的订阅操作菜单所指向的配置 id；None 表示菜单关闭。
@@ -542,6 +544,8 @@ impl PureClash {
         let profile_form_name = cx.new(|cx| TextInput::new(t!("profiles.name_placeholder"), cx));
         let profile_form_url = cx.new(|cx| TextInput::new(t!("profiles.url_placeholder"), cx));
         let profile_edit_url = cx.new(|cx| TextInput::new(t!("profiles.url_placeholder"), cx));
+            let profile_edit_user_agent =
+                cx.new(|cx| TextInput::new(t!("profiles.ua_placeholder"), cx));
         let profile_form_interval =
             cx.new(|cx| TextInput::new(t!("profiles.interval_placeholder"), cx));
         let profiles = config.profiles.clone();
@@ -618,6 +622,7 @@ impl PureClash {
             profile_form_name,
             profile_form_url,
             profile_edit_url,
+            profile_edit_user_agent,
             profile_busy: None,
             profile_error: runtime_error,
             auto_update_in_flight: None,

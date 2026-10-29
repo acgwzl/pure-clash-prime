@@ -14,6 +14,9 @@ use crate::mihomo::config::LocalBaseline;
 /// 下载订阅时的体积上限；正常订阅远小于该值，超出视为异常响应。
 pub(crate) const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
+/// 订阅下载默认 UA；与主流 Clash 客户端一致，机场据此返回 Clash 配置。
+pub(crate) const DEFAULT_SUBSCRIPTION_UA: &str = "clash.meta/pure-clash";
+
 /// 延迟测试默认探测地址；与主流 Clash 面板一致，返回 204。
 pub(crate) const DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 
@@ -327,14 +330,20 @@ impl Controller {
     /// 用量抹掉。
     pub(crate) fn download_subscription_with_usage(
         url: &str,
+        user_agent: Option<&str>,
     ) -> Result<(String, Option<crate::config::SubscriptionUsage>)> {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build();
+        // 机场普遍按 UA 决定返回格式：留空时用默认值，填了就以用户的为准。
+        let ua = user_agent
+            .map(str::trim)
+            .filter(|ua| !ua.is_empty())
+            .unwrap_or(DEFAULT_SUBSCRIPTION_UA);
         let response = agent
             .get(url)
-            .set("User-Agent", "clash.meta/pure-clash")
+            .set("User-Agent", ua)
             .call()
             .map_err(|error| anyhow::anyhow!("{error}"))
             .context("订阅下载失败")?;

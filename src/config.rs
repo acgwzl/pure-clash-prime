@@ -96,6 +96,12 @@ pub(crate) struct ProfileMeta {
     /// 于是每次进入配置页都重新请求一遍，等于反复骚扰同一个机场。
     #[serde(default)]
     pub(crate) usage_checked_at: u64,
+    /// 自定义 User-Agent；None 表示使用内置默认值。
+    ///
+    /// 不少机场按 UA 返回不同格式（clash / base64 / 403），
+    /// 默认 UA 拉不到时用户可以在这里覆盖。
+    #[serde(default)]
+    pub(crate) user_agent: Option<String>,
 }
 
 /// 订阅流量与有效期快照，来自响应头 `subscription-userinfo`。

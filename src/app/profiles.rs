@@ -971,16 +971,42 @@ fn profile_row(
 
 /// 订阅行内编辑器：链接修改后立即更新，仅改间隔时不触发下载。
 fn profile_editor(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyElement {
+    // 弹窗自带背景与圆角，内层只负责排版，不再叠一层卡片。
+    let editing_name = app
+        .editing_profile_index
+        .and_then(|index| app.profiles.get(index))
+        .map(|meta| SharedString::from(meta.name.clone()))
+        .unwrap_or_else(|| tr("profiles.menu_edit"));
     div()
         .id("profile-editor")
-        .p_4()
-        .rounded_md()
+        .p(px(22.0))
         .flex()
         .flex_col()
         .gap_2()
-        .bg(palette.surface)
-        .border_1()
-        .border_color(palette.accent)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pb_2()
+                .child(
+                    div()
+                        .text_size(px(15.0))
+                        .font_semibold()
+                        .text_color(palette.text)
+                        .truncate()
+                        .child(editing_name),
+                )
+                .child(
+                    div()
+                        .id("profile-editor-close")
+                        .flex_none()
+                        .cursor_pointer()
+                        .hover(|style| style.opacity(0.7))
+                        .child(icon(ICON_WINDOW_CLOSE, palette.muted, 14.0))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_profile_edit(cx))),
+                ),
+        )
         .child(
             div()
                 .text_sm()
@@ -995,6 +1021,8 @@ fn profile_editor(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>
                 .bg(palette.surface_alt)
                 .border_1()
                 .border_color(palette.border)
+                // 订阅链接往往远超输入框宽度，必须裁剪，否则会撑破弹窗。
+                .overflow_hidden()
                 .text_sm()
                 .text_color(palette.text)
                 .line_height(px(20.))
@@ -1030,6 +1058,32 @@ fn profile_editor(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>
                 .text_color(palette.text)
                 .line_height(px(20.))
                 .child(app.profile_form_interval.clone()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_medium()
+                .text_color(palette.text)
+                .child(tr("profiles.ua_label")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(palette.muted)
+                .child(tr("profiles.ua_hint")),
+        )
+        .child(
+            div()
+                .p_2()
+                .rounded_sm()
+                .bg(palette.surface_alt)
+                .border_1()
+                .border_color(palette.border)
+                .overflow_hidden()
+                .text_sm()
+                .text_color(palette.text)
+                .line_height(px(20.))
+                .child(app.profile_edit_user_agent.clone()),
         )
         .child(
             div()
@@ -1159,7 +1213,8 @@ pub(super) fn render_profile_menu(
                 .border_1()
                 .border_color(palette.border)
                 .shadow_lg()
-                .on_click(|_, _, _| {})
+                // 必须显式阻止冒泡：空 handler 不拦截事件，点击输入框会冒泡到遮罩。
+                .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                 .child(
                     div()
                         .px_4()
@@ -1223,7 +1278,7 @@ pub(super) fn render_profile_editor_overlay(
         .child(
             div()
                 .id("profile-editor-panel")
-                .w(px(520.0))
+                .w(px(480.0))
                 .flex()
                 .flex_col()
                 .rounded_lg()
@@ -1231,7 +1286,8 @@ pub(super) fn render_profile_editor_overlay(
                 .border_1()
                 .border_color(palette.border)
                 .shadow_lg()
-                .on_click(|_, _, _| {})
+                // 必须显式阻止冒泡：空 handler 不拦截事件，点击输入框会冒泡到遮罩。
+                .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                 .child(profile_editor(app, palette, cx)),
         )
         .into_any_element()

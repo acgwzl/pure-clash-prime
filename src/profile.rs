@@ -87,8 +87,9 @@ pub(crate) fn validate_and_store(
 /// 下载订阅并同时取回流量快照；机场不返回 `subscription-userinfo` 时为 `None`。
 pub(crate) fn download_subscription_with_usage(
     url: &str,
+    user_agent: Option<&str>,
 ) -> Result<(String, Option<SubscriptionUsage>)> {
-    Controller::download_subscription_with_usage(url)
+    Controller::download_subscription_with_usage(url, user_agent)
 }
 
 /// 只取订阅的用量响应头，不读取正文。
@@ -153,6 +154,7 @@ pub(crate) fn edit_subscription_metadata(
     meta: &mut ProfileMeta,
     url: &str,
     interval: &str,
+    user_agent: &str,
     now: u64,
 ) -> Result<bool> {
     let Some(previous_url) = meta.url.as_deref() else {
@@ -164,6 +166,12 @@ pub(crate) fn edit_subscription_metadata(
     let url_changed = previous_url != url;
     meta.url = Some(url.to_owned());
     meta.update_interval_minutes = minutes;
+    let ua = user_agent.trim();
+    meta.user_agent = if ua.is_empty() {
+        None
+    } else {
+        Some(ua.to_owned())
+    };
     // 从未更新的订阅首次启用定时更新时，从本次保存起算，避免意外立即到期。
     if minutes > 0 && meta.updated_at == 0 && meta.last_auto_attempt_at == 0 {
         meta.last_auto_attempt_at = now;
@@ -252,6 +260,7 @@ pub(crate) fn subscription_meta(name: String, url: String) -> ProfileMeta {
         last_auto_attempt_at: 0,
         usage: None,
         usage_checked_at: 0,
+        user_agent: None,
     }
 }
 
@@ -269,6 +278,7 @@ pub(crate) fn local_meta(name: String) -> ProfileMeta {
         // 本地导入的配置没有订阅地址，也就不存在流量信息。
         usage: None,
         usage_checked_at: 0,
+        user_agent: None,
     }
 }
 
