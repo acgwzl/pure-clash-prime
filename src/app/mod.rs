@@ -417,6 +417,8 @@ pub(crate) struct PureClash {
     net_check_loading: bool,
     /// 网络检测的失败提示;None 表示无错误。
     net_check_error: Option<String>,
+    /// 本次内核会话是否已自动跑过网络检测；换内核后归零。
+    net_check_auto_done: bool,
     /// 关于页检查更新是否进行中。
     update_checking: bool,
     /// 检查发现新版本时置位；界面用它强调更新提示。
@@ -644,6 +646,7 @@ impl PureClash {
             net_check_local: net_check::local_ip(),
             net_check_loading: false,
             net_check_error: None,
+            net_check_auto_done: false,
             update_checking: false,
             update_available: false,
             update_status: None,

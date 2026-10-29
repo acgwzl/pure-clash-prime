@@ -347,10 +347,15 @@ pub(super) fn format_profile_time(timestamp: u64) -> SharedString {
     if timestamp == 0 {
         return tr("profiles.never_updated");
     }
-    // 无chrono 依赖，用天数推算 UTC 日期，展示足够用的粗粒度时间。
-    let days = timestamp / 86_400;
+    // 无 chrono 依赖：按 UTC+8 推算日期与时分。
+    // 只显示到日会让「刚更新过」看起来像一天前，必须带时分。
+    let local = timestamp + 8 * 3_600;
+    let days = local / 86_400;
+    let secs = local % 86_400;
     let (year, month, day) = civil_from_days(days as i64);
-    SharedString::from(format!("{year:04}-{month:02}-{day:02}"))
+    let hour = secs / 3_600;
+    let minute = (secs % 3_600) / 60;
+    SharedString::from(format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}"))
 }
 
 /// 从 UNIX 天数转换为民用日期（Howard Hinnant 算法）。

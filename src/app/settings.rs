@@ -340,7 +340,9 @@ fn language_setting_row(
 ) -> AnyElement {
     div()
         // 卡内最后一行：分隔线交给卡片底缘，不再画一条悬空线。
-        .min_h(px(54.0))
+        // 行高与左右内边距必须和 setting_row 一致，否则这一行会明显贴边。
+        .min_h(px(62.0))
+        .px(px(20.0))
         .flex()
         .items_center()
         .gap_3()

@@ -4,7 +4,9 @@
 //! 通过 [`EntityInputHandler`] 接入平台 IME 与剪贴板，动作键经 KeyBinding 分发，
 //! 渲染交给父级容器控制样式。
 
+use std::cell::RefCell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -72,14 +74,22 @@ pub(crate) struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    /// 单行文本的水平滚动偏移；内容超过宽度时跟随光标移动。
-    ///
-    /// 锁定版本的 GPUI 没有内置滚动，TextElement 全程从容器左边缘绘制，
-    /// 长文本会直接画到容器外；这里记录偏移并在绘制时左移。
+    /// 滚轮留下的手动滚动偏移；manual_scroll 为 false 时不参与渲染。
     scroll_offset: Pixels,
-    /// 用户用滚轮手动滚动过；此时不再让光标位置自动覆盖滚动位置，
-    /// 直到下一次光标移动。
+    /// 用户用滚轮滚动过：此时按 scroll_offset 渲染，光标移动后恢复跟随。
     manual_scroll: bool,
+    /// 上一次绘制实际使用的偏移；点击换算与拖选需要它。
+    ///
+    /// 单独存一份而不是在 prepaint 里写回实体：渲染期间修改实体会触发
+    /// 下一帧重绘，拖选时表现为持续抖动。
+    last_scroll: Pixels,
+    /// 整形结果缓存：键是 (文本, 字号)。
+    ///
+    /// `shape_line` 对一条上百字符的订阅链接开销不小，而拖选时每次鼠标移动
+    /// 都会重绘；不缓存的话每帧都在重新整形，手感就是卡顿。
+    /// 用 Rc<RefCell> 共享给 TextElement，写入不经过实体 update，
+    /// 因此不会触发额外重绘。
+    shape_cache: Rc<RefCell<Option<(SharedString, Pixels, ShapedLine)>>>,
 }
 
 impl TextInput {
@@ -95,6 +105,8 @@ impl TextInput {
             last_bounds: None,
             scroll_offset: px(0.),
             manual_scroll: false,
+            last_scroll: px(0.),
+            shape_cache: Rc::new(RefCell::new(None)),
             is_selecting: false,
         }
     }
@@ -173,6 +185,8 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = true;
+        // 点击即恢复「跟随光标」：之前滚轮留下的偏移会让新定位显示在屏幕外。
+        self.manual_scroll = false;
 
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -208,9 +222,31 @@ impl TextInput {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+        if !self.is_selecting {
+            return;
         }
+        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
+        else {
+            self.select_to(self.index_for_mouse_position(event.position), cx);
+            return;
+        };
+
+        // 边缘定量滚动：鼠标贴住左右边缘时按固定步长推进，
+        // 手感接近普通文本编辑器，也不会因为光标位置反过来驱动滚动而震荡。
+        const EDGE: f32 = 16.0;
+        const STEP: f32 = 12.0;
+        let text_width = line.x_for_index(self.content.len());
+        let max_scroll = (text_width - bounds.size.width + px(8.)).max(px(0.));
+        if event.position.x >= bounds.right() - px(EDGE) {
+            self.scroll_offset = (self.scroll_offset + px(STEP)).min(max_scroll);
+            self.manual_scroll = true;
+        } else if event.position.x <= bounds.left() + px(EDGE) {
+            self.scroll_offset = (self.scroll_offset - px(STEP)).max(px(0.));
+            self.manual_scroll = true;
+        }
+
+        let index = self.index_for_mouse_position_with(event.position, self.scroll_offset);
+        self.select_to(index, cx);
     }
 
     fn show_character_palette(
@@ -248,8 +284,11 @@ impl TextInput {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         // 光标一动就恢复「跟随光标」的自动滚动。
         self.manual_scroll = false;
+        let changed = self.selected_range != (offset..offset);
         self.selected_range = offset..offset;
-        cx.notify()
+        if changed {
+            cx.notify()
+        }
     }
 
     fn cursor_offset(&self) -> usize {
@@ -258,6 +297,21 @@ impl TextInput {
         } else {
             self.selected_range.end
         }
+    }
+
+    /// 按给定滚动偏移换算字符索引；拖选时用当前偏移，避免用到上一帧的旧值。
+    fn index_for_mouse_position_with(&self, position: Point<Pixels>, scroll: Pixels) -> usize {
+        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
+        else {
+            return 0;
+        };
+        if position.x >= bounds.right() {
+            return self.content.len();
+        }
+        if position.x <= bounds.left() {
+            return 0;
+        }
+        line.closest_index_for_x(position.x - bounds.left() + scroll)
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -284,10 +338,11 @@ impl TextInput {
             return 0;
         }
         // 内容已横向滚动 scroll_offset，点击换算必须补回来，否则点不到后半段。
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_offset)
+        line.closest_index_for_x(position.x - bounds.left() + self.last_scroll)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let previous = self.selected_range.clone();
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -297,7 +352,11 @@ impl TextInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
-        cx.notify()
+        // 选区没变就不重绘：拖选时绝大多数鼠标事件落在同一字符上，
+        // 无条件 notify 会让每像素都触发一次渲染。
+        if self.selected_range != previous {
+            cx.notify()
+        }
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
@@ -484,12 +543,15 @@ impl EntityInputHandler for TextInput {
 /// 输入内容的实际渲染元素；负责排版、光标与选区绘制。
 struct TextElement {
     input: Entity<TextInput>,
+    shape_cache: Rc<RefCell<Option<(SharedString, Pixels, ShapedLine)>>>,
 }
 
 struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    /// 本次绘制使用的水平偏移。
+    scroll: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -582,27 +644,52 @@ impl Element for TextElement {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &runs, None);
+        // 命中缓存就复用：内容与字号都没变时不必重新整形。
+        // 有 marked_range（输入法组词）时必须重算，高亮运行会变。
+        let cached = if input.marked_range.is_none() {
+            self.shape_cache
+                .borrow()
+                .as_ref()
+                .filter(|(text, size, _)| {
+                    text.as_ref() == display_text.as_ref() && *size == font_size
+                })
+                .map(|(_, _, line)| line.clone())
+        } else {
+            None
+        };
+        let line = match cached {
+            Some(line) => line,
+            None => {
+                let line = window
+                    .text_system()
+                    .shape_line(display_text.clone(), font_size, &runs, None);
+                if input.marked_range.is_none() {
+                    *self.shape_cache.borrow_mut() =
+                        Some((display_text.clone(), font_size, line.clone()));
+                }
+                line
+            }
+        };
 
         let cursor_pos = line.x_for_index(cursor);
 
         // 水平滚动：光标逼近右边界时把内容左移，回到左边界外时归零。
         // 留 8px 余量，避免光标正好贴在边框上。
+        // 纯计算，不写回实体：渲染期间改实体会触发下一帧，拖选时表现为抖动。
         let visible_width = bounds.size.width;
-        let mut scroll = self.input.read(cx).scroll_offset;
-        // 用户手动滚动过就先保留他的位置，光标移动时再恢复跟随。
-        if !self.input.read(cx).manual_scroll {
-            if cursor_pos - scroll > visible_width - px(8.) {
-                scroll = cursor_pos - visible_width + px(8.);
-            }
-            if cursor_pos - scroll < px(0.) {
-                scroll = cursor_pos;
-            }
-        }
-        let scroll = scroll.max(px(0.));
-        self.input.update(cx, |input, _| input.scroll_offset = scroll);
+        let (manual_scroll, scroll_offset, is_selecting) = {
+            let input = self.input.read(cx);
+            (input.manual_scroll, input.scroll_offset, input.is_selecting)
+        };
+        // 拖选期间以 scroll_offset 为准：若还让光标驱动滚动，会出现
+        // 「滚一帧 → 光标按旧滚动值跳位 → 再滚」的来回震荡。
+        let scroll = if manual_scroll || is_selecting {
+            scroll_offset.max(px(0.))
+        } else if cursor_pos > visible_width - px(8.) {
+            (cursor_pos - visible_width + px(8.)).max(px(0.))
+        } else {
+            px(0.)
+        };
 
         let (selection, cursor) = if selected_range.is_empty() {
             (
@@ -637,6 +724,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll,
         }
     }
 
@@ -660,7 +748,7 @@ impl Element for TextElement {
             window.paint_quad(selection)
         }
         let line = prepaint.line.take().unwrap();
-        let scroll = self.input.read(cx).scroll_offset;
+        let scroll = prepaint.scroll;
         line.paint(
             point(bounds.left() - scroll, bounds.top()),
             window.line_height(),
@@ -680,6 +768,7 @@ impl Element for TextElement {
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.last_scroll = scroll;
         });
     }
 }
@@ -713,7 +802,10 @@ impl Render for TextInput {
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .line_height(px(20.))
             .text_size(px(13.))
-            .child(TextElement { input: cx.entity() })
+            .child(TextElement {
+                input: cx.entity(),
+                shape_cache: self.shape_cache.clone(),
+            })
     }
 }
 

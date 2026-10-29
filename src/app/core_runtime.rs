@@ -177,6 +177,8 @@ impl PureClash {
                 self.core_started_at = Some(std::time::Instant::now());
                 self.peak_down_speed = 0;
                 self.peak_up_speed = 0;
+                // 换内核后重新自动检测一次出口信息。
+                self.net_check_auto_done = false;
                 self.spawn_readiness_probe(generation, cx);
             }
             Err(error) => {
@@ -338,6 +340,12 @@ impl PureClash {
                         // 否则概览页的规则计数与规则页会一直是空态。
                         if this.rules.is_empty() && !this.rules_loading {
                             this.fetch_rules(cx);
+                        }
+                        // 内核就绪且拿到运行配置后自动查一次出口信息，
+                        // 省得用户每次开机都手动点「检测」。
+                        if !this.net_check_auto_done && !this.net_check_loading {
+                            this.net_check_auto_done = true;
+                            this.check_network(cx);
                         }
                         if this.runtime_state_failing {
                             this.runtime_state_failing = false;

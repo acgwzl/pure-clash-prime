@@ -929,14 +929,15 @@ impl PureClash {
         if self.profile_actions_locked() {
             return;
         }
-        let targets: Vec<(usize, String, String, Option<String>)> = self
+        // 带上名字：失败时要能告诉用户是哪一条没更新成功。
+        let targets: Vec<(usize, String, String, Option<String>, String)> = self
             .profiles
             .iter()
             .enumerate()
             .filter_map(|(index, meta)| {
                 meta.url
                     .clone()
-                    .map(|url| (index, url, meta.id.clone(), meta.user_agent.clone()))
+                    .map(|url| (index, url, meta.id.clone(), meta.user_agent.clone(), meta.name.clone()))
             })
             .collect();
         if targets.is_empty() {
@@ -962,15 +963,15 @@ impl PureClash {
             // 阶段一：并发下载。订阅站点的响应速度差异极大，串行时一个慢站
             // 会把整批拖到超时；下载是纯 IO，并发不会互相干扰。
             let (tx, rx) = async_channel::bounded(total);
-            for (index, url, id, user_agent) in targets {
+            for (index, url, id, user_agent, name) in targets {
                 let tx = tx.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        let result = (|| -> anyhow::Result<(usize, String, String)> {
-                            let content =
-                                profile::download_subscription_with_usage(&url, user_agent.as_deref())?
-                                    .0;
-                            Ok((index, id, content))
+                        let result = (|| -> Result<(usize, String, String, String), (String, anyhow::Error)> {
+                            match profile::download_subscription_with_usage(&url, user_agent.as_deref()) {
+                                Ok((content, _)) => Ok((index, id, content, name)),
+                                Err(error) => Err((name, error)),
+                            }
                         })();
                         let _ = tx.send(result).await;
                     })
@@ -978,14 +979,32 @@ impl PureClash {
             }
             drop(tx);
 
-            let mut downloaded: Vec<(usize, String, String)> = Vec::new();
+            let mut downloaded: Vec<(usize, String, String, String)> = Vec::new();
+            let mut download_failed_names: Vec<String> = Vec::new();
+            let mut download_done = 0usize;
             while let Ok(result) = rx.recv().await {
+                download_done += 1;
                 match result {
                     Ok(item) => downloaded.push(item),
-                    Err(error) => {
-                        log_warn!("profile", "批量更新下载失败：{error:#}");
+                    Err((name, error)) => {
+                        log_warn!("profile", "批量更新下载失败（{name}）：{error:#}");
+                        download_failed_names.push(name);
                     }
                 }
+                // 下载阶段也推进进度：否则界面上会长时间停在 0。
+                let done_text = download_done.to_string();
+                let total_text = total.to_string();
+                let _ = this.update(cx, |this, cx| {
+                    this.profile_busy = Some(
+                        t!(
+                            "profiles.busy_downloading_all",
+                            done = done_text,
+                            total = total_text
+                        )
+                        .into_owned(),
+                    );
+                    cx.notify();
+                });
             }
 
             // 阶段二：串行校验落盘。`-t` 校验与原子写是重活，串行避免同时
@@ -997,7 +1016,8 @@ impl PureClash {
             let download_failed = total.saturating_sub(downloaded_total);
             failed += download_failed;
 
-            for (step, (index, id, content)) in downloaded.into_iter().enumerate() {
+            let mut failed_names = download_failed_names;
+            for (step, (index, id, content, name)) in downloaded.into_iter().enumerate() {
                 let _ = this.update(cx, |this, cx| {
                     this.profile_busy = Some(
                         t!(
@@ -1034,7 +1054,8 @@ impl PureClash {
                     }
                     Err(error) => {
                         failed += 1;
-                        log_warn!("profile", "批量更新落盘失败：{error:#}");
+                        failed_names.push(name.clone());
+                        log_warn!("profile", "批量更新落盘失败（{name}）：{error:#}");
                     }
                 }
             }
@@ -1051,11 +1072,17 @@ impl PureClash {
                     }
                 }
                 if failed > 0 {
+                    let names = if failed_names.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", failed_names.join("、"))
+                    };
                     this.profile_error = Some(
                         t!(
                             "profiles.update_all_partial",
                             ok = ok.to_string(),
-                            failed = failed.to_string()
+                            failed = failed.to_string(),
+                            names = names
                         )
                         .into_owned(),
                     );

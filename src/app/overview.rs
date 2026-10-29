@@ -148,6 +148,11 @@ fn status_panel(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) 
                     tr("overview.active_profile"),
                     active_profile_name(app),
                     palette,
+                ))
+                .child(meta_pair(
+                    tr("overview.active_node"),
+                    active_node_name(app),
+                    palette,
                 )),
         )
 }
@@ -460,7 +465,7 @@ fn info_row(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> A
     div()
         .flex()
         .gap_4()
-        .h(px(118.0))
+        .h(px(128.0))
         .flex_none()
         .child(network_card(app, palette, cx).flex_1().min_w_0())
         .child(div().flex_1().min_w_0().child(profile_card(app, palette, cx)))
@@ -579,14 +584,22 @@ fn profile_card(
                 .child(name),
         )
         .child(
+            // 三项并排 + 换行会散成两截，改成单行紧凑写法，超出即省略。
             div()
                 .mt_1()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(count_pair(groups.to_string(), tr("overview.groups"), palette))
-                .child(count_pair(nodes.to_string(), tr("overview.nodes"), palette))
-                .child(count_pair(rules.to_string(), tr("overview.rules"), palette)),
+                .min_w_0()
+                .truncate()
+                .text_size(px(text_size::TINY))
+                .text_color(palette.faint)
+                .child(SharedString::from(format!(
+                    "{} {} · {} {} · {} {}",
+                    groups,
+                    tr("overview.groups"),
+                    nodes,
+                    tr("overview.nodes"),
+                    rules,
+                    tr("overview.rules"),
+                ))),
         )
         .into_any_element()
 }
@@ -868,10 +881,25 @@ fn connection_row(
 }
 
 fn groups_card(app: &PureClash, palette: Palette, cx: &mut Context<PureClash>) -> AnyElement {
-    let rows: Vec<AnyElement> = app
-        .groups
-        .iter()
-        .take(4)
+    // 承载流量的组优先展示（rules 的 MATCH 目标），其余按原顺序补齐。
+    let primary = active_group(app).map(|group| group.name.clone());
+    let mut ordered: Vec<&crate::mihomo::controller::GroupSnapshot> = Vec::new();
+    if let Some(name) = primary.as_deref() {
+        if let Some(group) = app.groups.iter().find(|group| group.name == name) {
+            ordered.push(group);
+        }
+    }
+    for group in app.groups.iter() {
+        if ordered.iter().any(|existing| existing.name == group.name) {
+            continue;
+        }
+        if ordered.len() >= 4 {
+            break;
+        }
+        ordered.push(group);
+    }
+    let rows: Vec<AnyElement> = ordered
+        .into_iter()
         .map(|group| group_row(group, palette))
         .collect();
 
@@ -958,16 +986,65 @@ fn group_row(group: &crate::mihomo::controller::GroupSnapshot, palette: Palette)
                 )
                 .child(
                     div()
-                        .text_size(px(text_size::TINY))
-                        .text_color(palette.faint)
-                        .truncate()
-                        .child(SharedString::from(group.now.clone())),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(px(text_size::TINY))
+                                .text_color(palette.faint)
+                                .truncate()
+                                .child(SharedString::from(group.now.clone())),
+                        )
+                        // url-test / fallback 由内核自动挑节点，不能手动指定。
+                        .when(!group.selectable, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(4.0))
+                                    .rounded_sm()
+                                    .bg(palette.inset)
+                                    .text_size(px(text_size::TINY))
+                                    .text_color(palette.muted)
+                                    .child(tr("overview.group_auto")),
+                            )
+                        }),
                 ),
         )
         .into_any_element()
 }
 
 // ---------------------------------------------------------------- 工具
+
+/// 承载流量的策略组：优先按已知命名找，找不到时退到第一个可手动选择的组。
+fn active_group(app: &PureClash) -> Option<&crate::mihomo::controller::GroupSnapshot> {
+    const PREFERRED: [&str; 4] = ["proxy", "PROXY", "节点选择", "Proxy"];
+    for name in PREFERRED {
+        if let Some(group) = app.groups.iter().find(|group| group.name == name) {
+            return Some(group);
+        }
+    }
+    app.groups
+        .iter()
+        .find(|group| group.selectable)
+        .or_else(|| app.groups.first())
+}
+
+/// 当前实际使用的节点：有活跃连接时以连接链首个节点为准，
+/// 没有连接时退到承载流量策略组的选择结果。
+fn active_node_name(app: &PureClash) -> SharedString {
+    if let Some(node) = app
+        .connections
+        .iter()
+        .find_map(|item| item.chains.first())
+    {
+        return SharedString::from(node.clone());
+    }
+    active_group(app)
+        .map(|group| SharedString::from(group.now.clone()))
+        .unwrap_or_else(|| tr("overview.no_selection"))
+}
 
 fn public_ip_text(app: &PureClash) -> SharedString {
     if app.net_check_loading {

@@ -12,7 +12,8 @@ use crate::theme::{FontWeightExt, Palette, TabularNums};
 use crate::ui::kit;
 
 /// 出口 IP 查询端点;返回 `ip` 与 `country_code`。
-const PUBLIC_IP_ENDPOINT: &str = "https://api.ip.sb/geoip";
+// 强制 IPv4：默认接口在有双栈时会返回 IPv6，地址过长且无法在状态面板完整展示。
+const PUBLIC_IP_ENDPOINT: &str = "https://api-ipv4.ip.sb/geoip";
 
 /// 出口 IP 查询超时;经代理绕行时留出余量,但不至于让按钮长期处于忙态。
 const NET_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
