@@ -82,7 +82,7 @@ mod view_state;
 pub(crate) use shell::AppShell;
 
 use extra_rules::render_picker_overlay;
-use profiles::render_profile_menu;
+use profiles::{render_profile_editor_overlay, render_profile_menu};
 #[cfg(target_os = "linux")]
 use frame::linux_client_side_decorations;
 use frame::render_titlebar;
@@ -691,6 +691,10 @@ impl Render for PureClash {
             // 订阅操作菜单同样挂在页面容器之外：遮罩不随页面滚动。
             .when(self.profile_menu_for.is_some(), |root| {
                 root.child(render_profile_menu(self, palette, cx))
+            })
+            // 订阅编辑弹窗同样挂在页面容器之外，两种视图共用。
+            .when(self.editing_profile_index.is_some(), |root| {
+                root.child(render_profile_editor_overlay(self, palette, cx))
             });
 
         #[cfg(target_os = "linux")]

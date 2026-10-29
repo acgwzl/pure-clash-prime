@@ -90,6 +90,36 @@ pub(super) fn render_profiles(
                 )
                 .child(
                     div()
+                        .id("profiles-update-all")
+                        .h(px(30.0))
+                        .px(px(15.0))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .map(|button| {
+                            if busy {
+                                button.opacity(0.5)
+                            } else {
+                                button.cursor_pointer()
+                            }
+                        })
+                        .bg(palette.surface)
+                        .border_1()
+                        .border_color(palette.border)
+                        .text_size(px(text_size::ROW))
+                        .text_color(palette.muted)
+                        .hover(|style| style.text_color(palette.text))
+                        .child(icon(ICON_REFRESH_CW, palette.muted, 13.0))
+                        .child(tr("profiles.update_all"))
+                        .when(!busy, |button| {
+                            button.on_click(
+                                cx.listener(|this, _, _, cx| this.update_all_profiles(cx)),
+                            )
+                        }),
+                )
+                .child(
+                    div()
                         .id("profiles-add")
                         .h(px(30.0))
                         .px(px(15.0))
@@ -140,21 +170,13 @@ pub(super) fn render_profiles(
         .child({
             let mut rows: Vec<AnyElement> = Vec::new();
             if app.profiles_view.is_grid() {
-                // 网格视图不显示内置默认配置卡片之外的行式布局；
-                // 编辑器仍紧随网格出现，避免离被编辑的卡片太远。
+                // 网格视图只渲染卡片；编辑器统一由页面级弹窗承担。
                 rows.push(profile_grid(app, palette, cx));
-                if app.editing_profile_index.is_some() {
-                    rows.push(profile_editor(app, palette, cx));
-                }
             } else {
                 // 内置默认配置常驻首行：无激活订阅时即为选中态。
                 rows.push(default_profile_row(app, palette, cx));
-                // 链接与间隔编辑器紧跟被编辑的订阅行展开。
                 for (index, meta) in app.profiles.iter().enumerate() {
                     rows.push(profile_row(app, index, meta, palette, cx));
-                    if app.editing_profile_index == Some(index) {
-                        rows.push(profile_editor(app, palette, cx));
-                    }
                 }
             }
             div().flex().flex_col().gap_3().children(rows)
@@ -1177,5 +1199,40 @@ fn menu_item(
         .child(icon(icon_path, palette.muted, 14.0))
         .child(div().text_sm().text_color(palette.text).child(label))
         .on_click(handler)
+        .into_any_element()
+}
+
+/// 订阅编辑弹窗：卡片与列表共用同一个浮层编辑器。
+///
+/// 原先编辑器内联在列表行下方，卡片视图没有落点；改成页面级浮层后
+/// 两种视图行为一致，也不会把列表撑长。
+pub(super) fn render_profile_editor_overlay(
+    app: &PureClash,
+    palette: Palette,
+    cx: &mut Context<PureClash>,
+) -> AnyElement {
+    div()
+        .id("profile-editor-scrim")
+        .absolute()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x00000099))
+        .on_click(cx.listener(|this, _, _, cx| this.cancel_profile_edit(cx)))
+        .child(
+            div()
+                .id("profile-editor-panel")
+                .w(px(520.0))
+                .flex()
+                .flex_col()
+                .rounded_lg()
+                .bg(palette.surface_high)
+                .border_1()
+                .border_color(palette.border)
+                .shadow_lg()
+                .on_click(|_, _, _| {})
+                .child(profile_editor(app, palette, cx)),
+        )
         .into_any_element()
 }

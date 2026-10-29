@@ -587,8 +587,7 @@ impl PureClash {
         let Some(url) = meta.url.clone() else {
             return;
         };
-        // 编辑器渲染在列表行下方，卡片视图里没有落点，先切回列表。
-        self.profiles_view = ProfilesView::List;
+        // 编辑器是页面级弹窗，与当前视图无关，不要顺手切换用户的视图选择。
         self.editing_profile_index = Some(index);
         let initial = if meta.update_interval_minutes == 0 {
             String::new()
@@ -907,5 +906,128 @@ impl PureClash {
     pub(super) fn close_profile_menu(&mut self, cx: &mut Context<Self>) {
         self.profile_menu_for = None;
         cx.notify();
+    }
+}
+
+impl PureClash {
+    /// 串行更新全部远程订阅：逐个下载、校验、落盘，最后统一保存并应用。
+    ///
+    /// 串行而非并发：每次更新都要走内核 `-t` 校验与原子落盘，
+    /// 并发会互相覆盖 runtime，也会让进度提示失去意义。
+    pub(super) fn update_all_profiles(&mut self, cx: &mut Context<Self>) {
+        if self.profile_actions_locked() {
+            return;
+        }
+        let targets: Vec<(usize, String, String)> = self
+            .profiles
+            .iter()
+            .enumerate()
+            .filter_map(|(index, meta)| meta.url.clone().map(|url| (index, url, meta.id.clone())))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let total = targets.len();
+        let version = self.config.mihomo_version.clone();
+        let paths = self.paths.clone();
+        let convert = self.config.convert_base64_subscription;
+        let active_id = self.active_profile.clone();
+        self.profile_busy = Some(
+            t!(
+                "profiles.busy_updating_all",
+                done = "0",
+                total = total.to_string()
+            )
+            .into_owned(),
+        );
+        self.profile_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let mut ok = 0usize;
+            let mut failed = 0usize;
+            let mut active_runtime: Option<(String, String)> = None;
+
+            for (step, (index, url, id)) in targets.into_iter().enumerate() {
+                let _ = this.update(cx, |this, cx| {
+                    this.profile_busy = Some(
+                        t!(
+                            "profiles.busy_updating_all",
+                            done = (step + 1).to_string(),
+                            total = total.to_string()
+                        )
+                        .into_owned(),
+                    );
+                    cx.notify();
+                });
+
+                let paths_inner = paths.clone();
+                let version_inner = version.clone();
+                let url_inner = url.clone();
+                let id_inner = id.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let content = profile::download_subscription_with_usage(&url_inner)?.0;
+                        let runtime = profile::validate_and_store(
+                            &paths_inner,
+                            &version_inner,
+                            &id_inner,
+                            &content,
+                            convert,
+                        )?;
+                        Ok::<_, anyhow::Error>(runtime)
+                    })
+                    .await;
+
+                match result {
+                    Ok(runtime) => {
+                        ok += 1;
+                        let _ = this.update(cx, |this, _| {
+                            if let Some(meta) = this.profiles.get_mut(index) {
+                                meta.updated_at = profile::now_secs();
+                            }
+                        });
+                        if active_id.as_deref() == Some(id.as_str()) {
+                            active_runtime = Some((id, runtime));
+                        }
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        log_warn!(
+                            "profile",
+                            "批量更新失败（{}）：{error:#}",
+                            host_of_url(&url)
+                        );
+                    }
+                }
+            }
+
+            let _ = this.update(cx, |this, cx| {
+                this.profile_busy = None;
+                this.save_profiles();
+                if let Some((id, runtime)) = active_runtime {
+                    if this.active_profile.as_deref() == Some(id.as_str()) {
+                        if let Err(error) = this.apply_runtime(&runtime, cx) {
+                            log_error!("profile", "应用批量更新后的运行时配置失败：{error:#}");
+                            this.profile_error = Some(concise_error(&format!("{error:#}"), 200));
+                        }
+                    }
+                }
+                if failed > 0 {
+                    this.profile_error = Some(
+                        t!(
+                            "profiles.update_all_partial",
+                            ok = ok.to_string(),
+                            failed = failed.to_string()
+                        )
+                        .into_owned(),
+                    );
+                }
+                log_info!("profile", "批量更新完成：成功 {ok}，失败 {failed}");
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
